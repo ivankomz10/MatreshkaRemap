@@ -1,0 +1,270 @@
+{
+	Tools = ordered() {
+		MatreshkaScreen = MacroOperator {
+			CtrlWZoom = false,
+			NameSet = true,
+			Inputs = ordered() {
+				MainInput1 = InstanceInput {
+					SourceOp = "In",
+					Source = "Input",
+					Name = "Source",
+				},
+				Mode = InstanceInput {
+					SourceOp = "PickMode",
+					Source = "Source",
+					Name = "Mode",
+					Default = 0,
+				},
+				Resolution = InstanceInput {
+					SourceOp = "PickMap",
+					Source = "Source",
+					Name = "Resolution",
+					Default = 0,
+				},
+				AreaCentre = InstanceInput {
+					SourceOp = "Flat",
+					Source = "AreaCentre",
+					Name = "Source area centre",
+				},
+				AreaHeight = InstanceInput {
+					SourceOp = "Flat",
+					Source = "AreaHeight",
+					Name = "Source area height",
+				},
+				AreaAspect = InstanceInput {
+					SourceOp = "Flat",
+					Source = "AreaAspect",
+					Name = "Source area aspect",
+				},
+				Center = InstanceInput {
+					SourceOp = "In",
+					Source = "Center",
+					Name = "Position",
+				},
+				UseSizeAndAspect = InstanceInput {
+					SourceOp = "In",
+					Source = "UseSizeAndAspect",
+					Name = "Size and aspect",
+				},
+				Size = InstanceInput {
+					SourceOp = "In",
+					Source = "Size",
+					Name = "Size",
+				},
+				Aspect = InstanceInput {
+					SourceOp = "In",
+					Source = "Aspect",
+					Name = "Aspect",
+				},
+				XSize = InstanceInput {
+					SourceOp = "In",
+					Source = "XSize",
+					Name = "X size",
+				},
+				YSize = InstanceInput {
+					SourceOp = "In",
+					Source = "YSize",
+					Name = "Y size",
+				},
+				Angle = InstanceInput {
+					SourceOp = "In",
+					Source = "Angle",
+					Name = "Angle",
+				},
+				FlipHoriz = InstanceInput {
+					SourceOp = "In",
+					Source = "FlipHoriz",
+					Name = "Flip horizontally",
+				},
+				FlipVert = InstanceInput {
+					SourceOp = "In",
+					Source = "FlipVert",
+					Name = "Flip vertically",
+				},
+			},
+			Outputs = {
+				MainOutput1 = InstanceOutput {
+					SourceOp = "PickMode",
+					Source = "Output",
+				}
+			},
+			ViewInfo = GroupInfo { Pos = { 0, 0 } },
+			Tools = ordered() {
+				In = Transform {
+					CtrlWZoom = false,
+					NameSet = true,
+					Inputs = {
+						GlobalIn = Input { Value = 0, },
+						GlobalOut = Input { Value = 1000000, },
+					},
+					ViewInfo = OperatorInfo { Pos = { 0, 0 } },
+				},
+				MapFull = Loader {
+					Clips = {
+						Clip {
+							ID = "Clip1",
+							Filename = "Macros:Matreshka/table_full_st.exr",
+							FormatID = "OpenEXRFormat",
+							StartFrame = -1,
+							LengthSetManually = true,
+							TrimIn = 0, TrimOut = 0,
+							ExtendFirst = 0, ExtendLast = 0,
+							Loop = 0, AspectMode = 0, Depth = 5,
+							TimeCode = 0, GlobalStart = 0, GlobalEnd = 0
+						}
+					},
+					CtrlWZoom = false,
+					NameSet = true,
+					Inputs = {
+						GlobalIn = Input { Value = 0, },
+						GlobalOut = Input { Value = 1000000, },
+						Depth = Input { Value = 5, },
+						["Clip1.OpenEXRFormat.RedName"] = Input { Value = FuID { "R" }, },
+						["Clip1.OpenEXRFormat.GreenName"] = Input { Value = FuID { "G" }, },
+						["Clip1.OpenEXRFormat.BlueName"] = Input { Value = FuID { "B" }, },
+						["Clip1.OpenEXRFormat.AlphaName"] = Input { Value = FuID { "A" }, }
+					},
+					ViewInfo = OperatorInfo { Pos = { 0, -148 } },
+				},
+				MapHalf = Loader {
+					Clips = {
+						Clip {
+							ID = "Clip1",
+							Filename = "Macros:Matreshka/table_half_st.exr",
+							FormatID = "OpenEXRFormat",
+							StartFrame = -1,
+							LengthSetManually = true,
+							TrimIn = 0, TrimOut = 0,
+							ExtendFirst = 0, ExtendLast = 0,
+							Loop = 0, AspectMode = 0, Depth = 5,
+							TimeCode = 0, GlobalStart = 0, GlobalEnd = 0
+						}
+					},
+					CtrlWZoom = false,
+					NameSet = true,
+					Inputs = {
+						GlobalIn = Input { Value = 0, },
+						GlobalOut = Input { Value = 1000000, },
+						Depth = Input { Value = 5, },
+						["Clip1.OpenEXRFormat.RedName"] = Input { Value = FuID { "R" }, },
+						["Clip1.OpenEXRFormat.GreenName"] = Input { Value = FuID { "G" }, },
+						["Clip1.OpenEXRFormat.BlueName"] = Input { Value = FuID { "B" }, },
+						["Clip1.OpenEXRFormat.AlphaName"] = Input { Value = FuID { "A" }, }
+					},
+					ViewInfo = OperatorInfo { Pos = { 0, -115 } },
+				},
+				MapQuarter = Loader {
+					Clips = {
+						Clip {
+							ID = "Clip1",
+							Filename = "Macros:Matreshka/table_quarter_st.exr",
+							FormatID = "OpenEXRFormat",
+							StartFrame = -1,
+							LengthSetManually = true,
+							TrimIn = 0, TrimOut = 0,
+							ExtendFirst = 0, ExtendLast = 0,
+							Loop = 0, AspectMode = 0, Depth = 5,
+							TimeCode = 0, GlobalStart = 0, GlobalEnd = 0
+						}
+					},
+					CtrlWZoom = false,
+					NameSet = true,
+					Inputs = {
+						GlobalIn = Input { Value = 0, },
+						GlobalOut = Input { Value = 1000000, },
+						Depth = Input { Value = 5, },
+						["Clip1.OpenEXRFormat.RedName"] = Input { Value = FuID { "R" }, },
+						["Clip1.OpenEXRFormat.GreenName"] = Input { Value = FuID { "G" }, },
+						["Clip1.OpenEXRFormat.BlueName"] = Input { Value = FuID { "B" }, },
+						["Clip1.OpenEXRFormat.AlphaName"] = Input { Value = FuID { "A" }, }
+					},
+					ViewInfo = OperatorInfo { Pos = { 0, -82 } },
+				},
+				MapViewer = Loader {
+					Clips = {
+						Clip {
+							ID = "Clip1",
+							Filename = "Macros:Matreshka/viewer_table_st.exr",
+							FormatID = "OpenEXRFormat",
+							StartFrame = -1,
+							LengthSetManually = true,
+							TrimIn = 0, TrimOut = 0,
+							ExtendFirst = 0, ExtendLast = 0,
+							Loop = 0, AspectMode = 0, Depth = 5,
+							TimeCode = 0, GlobalStart = 0, GlobalEnd = 0
+						}
+					},
+					CtrlWZoom = false,
+					NameSet = true,
+					Inputs = {
+						GlobalIn = Input { Value = 0, },
+						GlobalOut = Input { Value = 1000000, },
+						Depth = Input { Value = 5, },
+						["Clip1.OpenEXRFormat.RedName"] = Input { Value = FuID { "R" }, },
+						["Clip1.OpenEXRFormat.GreenName"] = Input { Value = FuID { "G" }, },
+						["Clip1.OpenEXRFormat.BlueName"] = Input { Value = FuID { "B" }, },
+						["Clip1.OpenEXRFormat.AlphaName"] = Input { Value = FuID { "A" }, }
+					},
+					ViewInfo = OperatorInfo { Pos = { 220, -148 } },
+				},
+				PickMap = Switch {
+					CtrlWZoom = false,
+					NameSet = true,
+					Inputs = {
+						GlobalIn = Input { Value = 0, },
+						GlobalOut = Input { Value = 1000000, },
+						NumberOfInputs = Input { Value = 3, },
+						Name0 = Input { Value = "Full", },
+						Name1 = Input { Value = "Half", },
+						Name2 = Input { Value = "Quarter", },
+						Input0 = Input { SourceOp = "MapFull", Source = "Output", },
+						Input1 = Input { SourceOp = "MapHalf", Source = "Output", },
+						Input2 = Input { SourceOp = "MapQuarter", Source = "Output", },
+					},
+					ViewInfo = OperatorInfo { Pos = { 110, -115 } },
+				},
+				Flat = Fuse.MatreshkaRemap {
+					CtrlWZoom = false,
+					NameSet = true,
+					Inputs = {
+						Source = Input { SourceOp = "In", Source = "Output", },
+						STMap = Input { SourceOp = "PickMap", Source = "Output", },
+						GlobalIn = Input { Value = 0, },
+						GlobalOut = Input { Value = 1000000, },
+						UseArea = Input { Value = 1, },
+						AreaCentre = Input { Value = { 0.5, 0.5 }, },
+						AreaHeight = Input { Value = 1, },
+						AreaAspect = Input { Value = 0.847458, },
+					},
+					ViewInfo = OperatorInfo { Pos = { 110, 0 } },
+				},
+				ViewerFull = Fuse.MatreshkaRemap {
+					CtrlWZoom = false,
+					NameSet = true,
+					Inputs = {
+						Source = Input { SourceOp = "Flat", Source = "Output", },
+						STMap = Input { SourceOp = "MapViewer", Source = "Output", },
+						GlobalIn = Input { Value = 0, },
+						GlobalOut = Input { Value = 1000000, },
+					},
+					ViewInfo = OperatorInfo { Pos = { 330, -60 } },
+				},
+				PickMode = Switch {
+					CtrlWZoom = false,
+					NameSet = true,
+					Inputs = {
+						GlobalIn = Input { Value = 0, },
+						GlobalOut = Input { Value = 1000000, },
+						NumberOfInputs = Input { Value = 2, },
+						Name0 = Input { Value = "Flat", },
+						Name1 = Input { Value = "Viewer", },
+						Input0 = Input { SourceOp = "Flat", Source = "Output", },
+						Input1 = Input { SourceOp = "ViewerFull", Source = "Output", },
+					},
+					ViewInfo = OperatorInfo { Pos = { 550, 0 } },
+				},
+			},
+		}
+	},
+	ActiveTool = "MatreshkaScreen"
+}

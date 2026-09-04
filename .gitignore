@@ -1,0 +1,89 @@
+# Matreshka Remap — what git does not carry.
+#
+# The rule: source and the baked .npz tables are tracked. Anything a build
+# step, a Blender bake, an export script or a render run can put back is not.
+
+
+# --- Python -----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+
+# --- Build output -----------------------------------------------------------
+# tool/build is PyInstaller's work directory (93 MB), tool/dist its result.
+build/
+dist/
+*.spec.bak
+
+# Shipped binaries and the archives they are packed into. Rebuilt by
+# build.bat / build_mac.sh / pack_mac.py.
+*.exe
+*.zip
+*.rar
+*.7z
+
+
+# --- mac_build --------------------------------------------------------------
+# pack_mac.py copies the app sources, requirements.txt and tables/*.npz here
+# from tool/ and converts line endings. Those copies are generated — the
+# originals in tool/ are what is tracked.
+#
+# The Mac-only files that live here and nowhere else (README_MAC.md,
+# build_mac.sh, build.spec, entitlements.plist, README.md) stay tracked.
+/mac_build/*.py
+/mac_build/requirements.txt
+/mac_build/tables/
+/mac_build/Check.png
+
+
+# --- Baked tables -----------------------------------------------------------
+# The .npz ARE tracked: they are what the renderer reads, and remaking them
+# needs Blender plus the .blend scene. They total about 5.5 MB.
+#
+# The EXRs are not, and there are three sets of them (~29 MB in all):
+#   tool/tables/*.exr        the sharp reference pass from bake_tables.py
+#   tool/tables/st/*.exr     written from the npz by export_tables_exr.py
+#   fusion_plugin/Macros/    byte-identical copies of tables/st, installed
+#                            into Resolve by copy_to_resolve.py
+*.exr
+
+
+# --- Media, renders, working state ------------------------------------------
+# Sources and results. 3.6 GB between them; none of it is source code.
+/ToRemap/
+/OUT/
+/Remaped/
+/Snapshots/
+/Flipbook/
+/Logs/
+*.mp4
+*.mov
+*.mxf
+*.prores
+
+# Blender autosave. The scene itself (zaryadye_remap_v1.blend) is tracked.
+*.blend1
+*.blend2
+
+# Written by the application while it runs, not a setting anyone edits.
+# tool/remap_tool.json — the shipped default — stays tracked.
+/remap_tool.json
+/ui_span.txt
+*.log
+
+
+# --- Stray -------------------------------------------------------------------
+.__perm_test
+
+
+# --- OS / editors -----------------------------------------------------------
+Thumbs.db
+desktop.ini
+.DS_Store
+.idea/
+.vscode/
+*.swp

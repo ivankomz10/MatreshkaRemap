@@ -1,0 +1,221 @@
+--[[--------------------------------------------------------------------------
+Matreshka Remap -- the Zaryadye screen reprojection, as a Fusion node.
+
+Takes a source frame and a baked ST map, and answers with the frame as the
+screen sees it. The map holds, per output pixel, where in the source to read
+(u in red, v in green) and how much of that pixel the screen covers at all
+(alpha). Nothing here is computed from geometry at run time: the scene is
+static, so the mapping was baked once and this is a gather.
+
+Four samples per output pixel, not one. One output pixel of this map reaches
+across 1.0 to 2.0 source pixels, and a single sample cannot see that far -- on
+detail near the source's own pixel grid that shows as crawl. The standalone
+renderer answers this with a mip chain and a baked level of detail; a Fusion
+kernel has no mip levels, so four taps at the quarter points is the only
+filtering available here. Measured against the same mapping supersampled
+sixteen times, four taps without mips beat one tap with them.
+
+The map must be the one exported from the npz (`table_*_st.exr`), not the
+`table_*.exr` sitting beside it. Those are one of the two passes the bake
+renders -- premultiplied, and carrying that pass's own hard-edged coverage.
+--------------------------------------------------------------------------]]--
+
+FuRegisterClass("MatreshkaRemap", CT_Tool, {
+	REGS_Category = "Fuses\\Matreshka",
+	REGS_OpIconString = "MRm",
+	REGS_OpDescription = "Reprojects a frame through a baked ST map",
+	REG_NoObjMatCtrls = true,
+	REG_NoMotionBlurCtrls = true,
+	})
+
+RemapParams = [[
+	int srcsize[2];
+	int dstsize[2];
+	int taps;
+	int compOrder;
+	float area[4];
+]]
+
+RemapSource = [[
+__KERNEL__ void RemapKernel(__CONSTANTREF__ RemapParams *params,
+	__TEXTURE2D__ src,
+	__TEXTURE2D__ map,
+	__TEXTURE2D_WRITE__ dst)
+{
+	DEFINE_KERNEL_ITERATORS_XY(x, y)
+	if (x >= params->dstsize[0] || y >= params->dstsize[1])
+		return;
+
+	float2 step = to_float2(1.0f / (float)params->dstsize[0],
+	                        1.0f / (float)params->dstsize[1]);
+	float2 here = to_float2((float)x + 0.5f, (float)y + 0.5f) * step;
+
+	float4 entry = _tex2DVecN(map, here.x, here.y, 15);
+	float coverage = entry.w;
+	if (coverage <= 0.0f)
+	{
+		_tex2DVec4Write(dst, x, y, to_float4(0.0f, 0.0f, 0.0f, 0.0f));
+		return;
+	}
+
+	// The map's coordinates run 0..1 across the picture it was baked against.
+	// On the Fusion page that picture is usually the whole input, but on the
+	// Edit page the input is the timeline frame with a clip sitting somewhere
+	// inside it. `area` says which part of the input those 0..1 refer to; the
+	// whole frame by default, and then this is the identity.
+	float2 origin = to_float2(params->area[0], params->area[1]);
+	float2 span = to_float2(params->area[2], params->area[3]);
+	float2 uv = origin + to_float2(entry.x, entry.y) * span;
+	float4 colour = _tex2DVecN(src, uv.x, uv.y, params->compOrder);
+
+	if (params->taps > 1)
+	{
+		// Where the taps go comes from the map itself: the entries either side
+		// are where the neighbouring output pixels read from, so the
+		// difference is exactly how far one output pixel reaches into the
+		// source. Nothing has to be re-baked to know it.
+		float4 across = _tex2DVecN(map, here.x + step.x, here.y, 15);
+		float4 down   = _tex2DVecN(map, here.x, here.y + step.y, 15);
+
+		// At the last column and row there is no neighbour to difference
+		// against and the map answers with nothing, which would fling the taps
+		// across the whole picture. Those edges keep the single sample.
+		if (across.w > 0.0f && down.w > 0.0f)
+		{
+			// The neighbours are map entries, so they need the same mapping
+			// before they can be differenced against where we are reading.
+			float2 ua = origin + to_float2(across.x, across.y) * span;
+			float2 ub = origin + to_float2(down.x, down.y) * span;
+			float2 du = to_float2(ua.x - uv.x, ua.y - uv.y) * 0.25f;
+			float2 dv = to_float2(ub.x - uv.x, ub.y - uv.y) * 0.25f;
+			float4 a = _tex2DVecN(src, uv.x - du.x - dv.x, uv.y - du.y - dv.y, params->compOrder);
+			float4 b = _tex2DVecN(src, uv.x + du.x - dv.x, uv.y + du.y - dv.y, params->compOrder);
+			float4 c = _tex2DVecN(src, uv.x - du.x + dv.x, uv.y - du.y + dv.y, params->compOrder);
+			float4 d = _tex2DVecN(src, uv.x + du.x + dv.x, uv.y + du.y + dv.y, params->compOrder);
+			colour = (a + b + c + d) * 0.25f;
+		}
+	}
+
+	// Premultiplied, which is what Fusion expects and what lets this go
+	// straight onto a background through a Merge.
+	_tex2DVec4Write(dst, x, y, to_float4(colour.x * coverage,
+	                                     colour.y * coverage,
+	                                     colour.z * coverage,
+	                                     coverage));
+}
+]]
+
+
+function Create()
+	InImage = self:AddInput("Source", "Source", {
+		LINKID_DataType = "Image",
+		LINK_Main = 1,
+		})
+
+	InMap = self:AddInput("ST map", "STMap", {
+		LINKID_DataType = "Image",
+		LINK_Main = 2,
+		})
+
+	InUseArea = self:AddInput("Read from an area", "UseArea", {
+		LINKID_DataType = "Number",
+		INPID_InputControl = "CheckboxControl",
+		INP_Default = 0.0,
+		INP_Integer = true,
+		})
+
+	InAreaCentre = self:AddInput("Area centre", "AreaCentre", {
+		LINKID_DataType = "Point",
+		INPID_InputControl = "OffsetControl",
+		INPID_PreviewControl = "CrosshairControl",
+		INP_DefaultX = 0.5,
+		INP_DefaultY = 0.5,
+		})
+
+	InAreaHeight = self:AddInput("Area height", "AreaHeight", {
+		LINKID_DataType = "Number",
+		INPID_InputControl = "SliderControl",
+		INP_Default = 1.0,
+		INP_MinScale = 0.05,
+		INP_MaxScale = 2.0,
+		})
+
+	InAreaAspect = self:AddInput("Area aspect", "AreaAspect", {
+		LINKID_DataType = "Number",
+		INPID_InputControl = "SliderControl",
+		INP_Default = 0.847458,
+		INP_MinScale = 0.1,
+		INP_MaxScale = 4.0,
+		})
+
+	InTaps = self:AddInput("Fine sampling", "FineSampling", {
+		LINKID_DataType = "Number",
+		INPID_InputControl = "CheckboxControl",
+		INP_Default = 1.0,
+		INP_Integer = true,
+		})
+
+	OutImage = self:AddOutput("Output", "Output", {
+		LINKID_DataType = "Image",
+		LINK_Main = 1,
+		})
+end
+
+
+function Process(req)
+	local src = InImage:GetValue(req)
+	local map = InMap:GetValue(req)
+	if not src or not map then
+		OutImage:Set(req, nil)
+		return
+	end
+
+	-- The frame comes out the size of the map, not the size of the source or
+	-- of the comp: this is the screen's own layout, and it has its own shape.
+	local out = Image({
+		IMG_Like = map,
+		IMG_Depth = IMDP_128bitFloat,
+		})
+
+	local node = DVIPComputeNode(req, "RemapKernel", RemapSource,
+	                             "RemapParams", RemapParams)
+	local ok = false
+	if node then
+		local params = node:GetParamBlock(RemapParams)
+		params.srcsize[0] = src.DataWindow:Width()
+		params.srcsize[1] = src.DataWindow:Height()
+		params.dstsize[0] = out.DataWindow:Width()
+		params.dstsize[1] = out.DataWindow:Height()
+		params.taps = (InTaps:GetValue(req).Value > 0.5) and 4 or 1
+		params.compOrder = 15
+
+		-- Worked out here, where the frame's real size is known, rather than in
+		-- the kernel: keeping an aspect means knowing how many pixels wide the
+		-- frame is, and that is not something the kernel should have to care
+		-- about twice over.
+		local x, y, w, h = 0.0, 0.0, 1.0, 1.0
+		if InUseArea:GetValue(req).Value > 0.5 then
+			local frame_w = src.DataWindow:Width()
+			local frame_h = src.DataWindow:Height()
+			local centre = InAreaCentre:GetValue(req)
+			h = InAreaHeight:GetValue(req).Value
+			w = h * InAreaAspect:GetValue(req).Value * frame_h / frame_w
+			x = centre.X - w * 0.5
+			y = centre.Y - h * 0.5
+		end
+		params.area[0] = x
+		params.area[1] = y
+		params.area[2] = w
+		params.area[3] = h
+		node:SetParamBlock(params)
+
+		node:AddSampler("Sampler", TEX_FILTER_MODE_LINEAR,
+		                TEX_ADDRESS_MODE_CLAMP, TEX_NORMALIZED_COORDS_TRUE)
+		node:AddInput("src", src)
+		node:AddInput("map", map)
+		node:AddOutput("dst", out)
+		ok = node:RunSession(req)
+	end
+
+	OutImage:Set(req, ok and out or nil)
+end
