@@ -17,6 +17,8 @@ from pathlib import Path
 
 import numpy as np
 
+import transform
+
 # How a frame's own transparency is to be read. Not a style: getting it wrong
 # is visible along every soft edge, dark if premultiplied footage is called
 # straight and bright the other way round.
@@ -46,13 +48,20 @@ struct Settings {
     // x premul out, y overlay, z overlay space, w taps
     flags: vec4<f32>,
     // x source alpha: 0 ignore, 1 premultiplied, 2 straight
+    // y window aspect, z transform in use, w edge: 0 clear, 1 black, 2 repeat
     more: vec4<f32>,
+    xform0: vec4<f32>,   // cos, sin, 1/scale x, 1/scale y
+    xform1: vec4<f32>,   // pivot x, pivot y, position x, position y
+    xform2: vec4<f32>,   // what the crop keeps: left, top, right, bottom
+    xform3: vec4<f32>,   // flip across, flip down, frame plane on, frame fit
+    xform4: vec4<f32>,   // frame aspect, output aspect
 };
 @group(0) @binding(0) var table: texture_2d<f32>;
 @group(0) @binding(1) var source: texture_2d<f32>;
 @group(0) @binding(2) var source_sampler: sampler;
 @group(0) @binding(3) var<uniform> settings: Settings;
 @group(0) @binding(4) var overlay: texture_2d<f32>;
+@group(0) @binding(5) var frame_plane: texture_2d<f32>;
 
 
 // The source's own transparency is undone in the space it was applied in.
@@ -72,6 +81,29 @@ fn linearised(c: vec3<f32>) -> vec3<f32> {
                   safe / 12.92, safe <= vec3<f32>(0.04045));
 }
 
+// A point of the window as a point of the source frame -- the inverse of what
+// the editor draws with, because a gather asks "where did this pixel come
+// from" and never "where does this pixel go".
+//
+// Rotation has to happen where a circle is round, so both ways through it the
+// horizontal is stretched by the window's aspect and put back afterwards.
+fn to_source(m: vec2<f32>) -> vec2<f32> {
+    if (settings.more.z < 0.5) {
+        return m;               // identity, and the same instructions as before
+    }
+    let aspect = settings.more.y;
+    let ax = (m.x - settings.xform1.x - settings.xform1.z) * aspect;
+    let ay = m.y - settings.xform1.y - settings.xform1.w;
+    let cos = settings.xform0.x;
+    let sin = settings.xform0.y;
+    let rx = (ax * cos + ay * sin) * settings.xform0.z;
+    let ry = (ay * cos - ax * sin) * settings.xform0.w;
+    var f = vec2<f32>(rx / aspect + settings.xform1.x, ry + settings.xform1.y);
+    if (settings.xform3.x > 0.5) { f.x = 1.0 - f.x; }
+    if (settings.xform3.y > 0.5) { f.y = 1.0 - f.y; }
+    return f;
+}
+
 @fragment
 fn fs_main(in: VOut) -> @location(0) vec4<f32> {
     let texel = vec2<i32>(i32(in.pos.x), i32(in.pos.y));
@@ -83,7 +115,35 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
     }
 
     // Blender's UV origin is bottom-left, a texture's is top-left.
-    let uv = vec2<f32>(entry.x, 1.0 - entry.y);
+    var uv = to_source(vec2<f32>(entry.x, 1.0 - entry.y));
+
+    // The clip's own edge, once it can be moved off the window. Two numbers
+    // because the three ways of ending a picture differ in what they touch:
+    // clear takes the alpha out, black takes the colour out, repeat takes
+    // neither and reads the last row of pixels instead.
+    var edge_alpha = 1.0;
+    var edge_dark = 1.0;
+    if (settings.more.z > 0.5) {
+        let lo = settings.xform2.xy;
+        let hi = settings.xform2.zw;
+        if (settings.more.w > 1.5) {
+            uv = clamp(uv, lo, hi);
+        } else {
+            // How far this output pixel reaches is already baked into the
+            // table; the scale is the only thing that changes it. Fading over
+            // exactly that distance makes the clip's edge and the wall's edge
+            // look like they were drawn by the same hand.
+            let size = vec2<f32>(textureDimensions(source, 0));
+            let reach = exp2(entry.w);
+            let span = max(vec2<f32>(reach * settings.xform0.z / size.x,
+                                     reach * settings.xform0.w / size.y),
+                           vec2<f32>(1e-6));
+            let inside = clamp((uv - lo) / span + 0.5, vec2<f32>(0.0), vec2<f32>(1.0))
+                       * clamp((hi - uv) / span + 0.5, vec2<f32>(0.0), vec2<f32>(1.0));
+            let cover = inside.x * inside.y;
+            if (settings.more.w > 0.5) { edge_dark = cover; } else { edge_alpha = cover; }
+        }
+    }
     // The level of detail is baked in: the footprint of an output pixel in the
     // source is fixed, so there is nothing to derive at run time.
     var colour = textureSampleLevel(source, source_sampler, uv, entry.w);
@@ -111,8 +171,10 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
         // against; textureLoad answers zero there, which would fling the taps
         // across the whole picture. Those edges keep the single tap.
         if (across.z > 0.0 && down.z > 0.0) {
-            let du = vec2<f32>(across.x - entry.x, -(across.y - entry.y)) * 0.25;
-            let dv = vec2<f32>(down.x - entry.x, -(down.y - entry.y)) * 0.25;
+            // Through the same map as the centre, or the taps would step in
+            // the window's directions while the sample sits in the source's.
+            let du = (to_source(vec2<f32>(across.x, 1.0 - across.y)) - uv) * 0.25;
+            let dv = (to_source(vec2<f32>(down.x, 1.0 - down.y)) - uv) * 0.25;
             let lod = max(entry.w - 0.8, 0.0);
             colour = 0.25 * (
                 textureSampleLevel(source, source_sampler, uv - du - dv, lod)
@@ -135,6 +197,32 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
             rgb = linearised(encoded(rgb) / max(source_alpha, 1.0 / 255.0));
         }
     }
+    // Before the layout map is drawn: the map is a ruler over the finished
+    // frame and has no business being darkened by where the clip ends.
+    rgb = rgb * edge_dark;
+
+    // A border drawn on the wall: over the reprojection, under the layout map.
+    // It sits in the finished frame rather than in the source, so it does not
+    // travel with the clip -- the frame belongs to the screen, the picture
+    // moves inside it.
+    if (settings.xform3.z > 0.0) {
+        let shown = vec2<f32>(textureDimensions(table));
+        var deco_uv = in.pos.xy / shown;
+        if (settings.xform3.w > 0.5) {
+            // Fit: the border keeps its own shape and the rest is left alone.
+            let ratio = settings.xform4.x / max(settings.xform4.y, 1e-6);
+            if (ratio > 1.0) {
+                deco_uv.y = (deco_uv.y - 0.5) * ratio + 0.5;
+            } else {
+                deco_uv.x = (deco_uv.x - 0.5) / max(ratio, 1e-6) + 0.5;
+            }
+        }
+        if (deco_uv.x >= 0.0 && deco_uv.x <= 1.0
+            && deco_uv.y >= 0.0 && deco_uv.y <= 1.0) {
+            let deco = textureSampleLevel(frame_plane, source_sampler, deco_uv, 0.0);
+            rgb = mix(rgb, deco.rgb, deco.a);
+        }
+    }
 
     // Where the layout map is drawn decides where it is read. A map drawn in
     // the space being sampled (settings.flags.z = 0) is read at the same coordinates
@@ -152,7 +240,7 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
     // Premultiplied, so dropping alpha gives exactly a composite over black;
     // straight alpha is what PNG and ProRes 4444 want instead. Either way the
     // alpha written is both transparencies at once.
-    let alpha = coverage * source_alpha;
+    let alpha = coverage * source_alpha * edge_alpha;
     let weight = mix(1.0, alpha, settings.flags.x);
     return vec4<f32>(rgb * weight, alpha);
 }
@@ -328,6 +416,7 @@ class GpuRemapper:
         self.levels = mip_count(self.source_width, self.source_height)
         self._premultiplied = True
         self._source_alpha = ALPHA_IGNORE
+        self._transform = None
         # Planes cost a third of RGBA over the pipe, which is the pipeline's
         # limit -- but 4:2:0 has nowhere to put an alpha channel. Frames whose
         # own transparency counts have to come across whole.
@@ -474,7 +563,7 @@ class GpuRemapper:
         )
 
         self.flags = device.create_buffer(
-            size=32,
+            size=112,
             usage=wgpu.BufferUsage.UNIFORM | wgpu.BufferUsage.COPY_DST,
         )
         self.set_premultiplied(self._premultiplied)
@@ -534,7 +623,16 @@ class GpuRemapper:
         self._overlay_opacity = 0.0
         self._overlay_size = (0, 0)
         self._overlay_texture = None
-        self.set_overlay(np.zeros((1, 1, 4), dtype=np.uint8))
+        self._frame_size = (0, 0)
+        self._frame_texture = None
+        self._frame_on = False
+        self._frame_fit = False
+        self._frame_aspect = 1.0
+        blank = np.zeros((1, 1, 4), dtype=np.uint8)
+        # The frame plane first: the overlay's upload builds the bind group,
+        # and a bind group cannot name a texture that does not exist yet.
+        self._upload_plane("frame", blank)
+        self.set_overlay(blank)
 
         self.mip_views = [
             self.source_texture.create_view(base_mip_level=level, mip_level_count=1)
@@ -573,30 +671,61 @@ class GpuRemapper:
         self._supersample = bool(on)
         self._write_flags()
 
-    def set_overlay(self, image: np.ndarray) -> None:
-        """A picture in the same space as the source, drawn on at sampling time."""
+    def _rebuild_bind_group(self) -> None:
+        """Both drawn-on planes are part of it, so either one resizing rebuilds."""
+        self.bind_group = self.device.create_bind_group(
+            layout=self.pipeline.get_bind_group_layout(0),
+            entries=[
+                {"binding": 0, "resource": self.table_view},
+                {"binding": 1, "resource": self.source_view},
+                {"binding": 2, "resource": self.sampler},
+                {"binding": 3, "resource": {"buffer": self.flags,
+                                            "offset": 0, "size": 112}},
+                {"binding": 4, "resource": self._overlay_texture.create_view()},
+                {"binding": 5, "resource": self._frame_texture.create_view()},
+            ])
+
+    def _upload_plane(self, which: str, image: np.ndarray):
+        """Put a picture on one of the drawn-on planes, resizing if it has to."""
         wgpu, device = self.wgpu, self.device
         height, width = image.shape[:2]
-        if self._overlay_size != (width, height):
-            self._overlay_size = (width, height)
-            self._overlay_texture = device.create_texture(
+        texture = getattr(self, f"_{which}_texture", None)
+        if getattr(self, f"_{which}_size", None) != (width, height):
+            setattr(self, f"_{which}_size", (width, height))
+            texture = device.create_texture(
                 size=(width, height, 1), format="rgba8unorm-srgb",
                 usage=wgpu.TextureUsage.TEXTURE_BINDING | wgpu.TextureUsage.COPY_DST)
-            self.bind_group = device.create_bind_group(
-                layout=self.pipeline.get_bind_group_layout(0),
-                entries=[
-                    {"binding": 0, "resource": self.table_view},
-                    {"binding": 1, "resource": self.source_view},
-                    {"binding": 2, "resource": self.sampler},
-                    {"binding": 3, "resource": {"buffer": self.flags,
-                                                "offset": 0, "size": 32}},
-                    {"binding": 4, "resource": self._overlay_texture.create_view()},
-                ])
+            setattr(self, f"_{which}_texture", texture)
+            # Only once both planes exist: a bind group has to name every
+            # binding, and the first upload of a fresh engine has only one.
+            if self._overlay_texture is not None and self._frame_texture is not None:
+                self._rebuild_bind_group()
         device.queue.write_texture(
-            {"texture": self._overlay_texture},
-            np.ascontiguousarray(image),
+            {"texture": texture}, np.ascontiguousarray(image),
             {"bytes_per_row": width * 4, "rows_per_image": height},
             (width, height, 1))
+
+    def set_overlay(self, image: np.ndarray) -> None:
+        """A picture in the same space as the source, drawn on at sampling time."""
+        self._upload_plane("overlay", image)
+
+    def set_frame_plane(self, image: np.ndarray | None) -> None:
+        """A border drawn on the finished frame, over the picture.
+
+        None switches it off rather than uploading a blank, so a frame nobody
+        asked for costs nothing at all.
+        """
+        self._frame_on = image is not None
+        if image is not None:
+            height, width = image.shape[:2]
+            self._frame_aspect = width / max(height, 1)
+            self._upload_plane("frame", image)
+        self._write_flags()
+
+    def set_frame_fit(self, fit: bool) -> None:
+        """Fit keeps the border's own shape; otherwise it is stretched to fill."""
+        self._frame_fit = bool(fit)
+        self._write_flags()
 
     def set_overlay_opacity(self, opacity: float) -> None:
         self._overlay_opacity = float(max(0.0, min(1.0, opacity)))
@@ -618,14 +747,34 @@ class GpuRemapper:
         self.wants_yuv = self._source_alpha == ALPHA_IGNORE
         self._write_flags()
 
+    def set_transform(self, placement) -> None:
+        """Where the clip sits inside the window the tables read from.
+
+        `None`, or anything that says it is the identity, switches the whole
+        path off in the shader rather than running a transform that happens to
+        change nothing -- so a render made without opening the editor comes out
+        as the same bytes it did before there was one.
+        """
+        self._transform = None if placement is None or placement.is_identity             else placement
+        self._write_flags()
+
     def _write_flags(self) -> None:
-        value = np.array([1.0 if self._premultiplied else 0.0,
-                          getattr(self, "_overlay_opacity", 0.0),
-                          1.0 if getattr(self, "_overlay_on_output", False) else 0.0,
-                          1.0 if getattr(self, "_supersample", False) else 0.0,
-                          float(getattr(self, "_source_alpha", ALPHA_IGNORE)),
-                          0.0, 0.0, 0.0],
-                         dtype=np.float32)
+        placement = getattr(self, "_transform", None)
+        value = np.zeros(28, dtype=np.float32)
+        value[0] = 1.0 if self._premultiplied else 0.0
+        value[1] = getattr(self, "_overlay_opacity", 0.0)
+        value[2] = 1.0 if getattr(self, "_overlay_on_output", False) else 0.0
+        value[3] = 1.0 if getattr(self, "_supersample", False) else 0.0
+        value[4] = float(getattr(self, "_source_alpha", ALPHA_IGNORE))
+        value[5] = transform.SOURCE_ASPECT
+        value[6] = 0.0 if placement is None else 1.0
+        value[7] = 0.0 if placement is None else float(placement.edge)
+        if placement is not None:
+            value[8:24] = placement.uniforms()
+        value[22] = 1.0 if getattr(self, "_frame_on", False) else 0.0
+        value[23] = 1.0 if getattr(self, "_frame_fit", False) else 0.0
+        value[24] = getattr(self, "_frame_aspect", 1.0)
+        value[25] = self.width / max(self.height, 1)
         self.device.queue.write_buffer(self.flags, 0, value.tobytes())
 
     # -- per frame ---------------------------------------------------------
@@ -873,9 +1022,10 @@ class CpuRemapper:
 
         self.premultiplied = True
         self.source_alpha = ALPHA_IGNORE
-        self.map_x = (table.u * self.source_width - 0.5).astype(np.float32)
-        self.map_y = ((1.0 - table.v) * self.source_height - 0.5).astype(np.float32)
-        self.coverage = table.coverage[..., None]
+        self._transform = None
+        self._edge_alpha = None
+        self._edge_dark = None
+        self.set_transform(None)
 
         ramp = np.arange(256, dtype=np.float32) / 255.0
         self.to_linear = np.where(
@@ -908,11 +1058,72 @@ class CpuRemapper:
     def set_source_alpha(self, mode: int) -> None:
         self.source_alpha = int(mode)
 
+    def set_transform(self, placement=None) -> None:
+        """Rebuild the gather maps for where the clip now sits.
+
+        The maps are the whole of this renderer's speed, so they are built once
+        here rather than per frame -- the transform is static, the same as the
+        table is.
+        """
+        self._transform = None if placement is None or placement.is_identity             else placement
+        window_x = self.table.u
+        window_y = 1.0 - self.table.v
+        self._edge_alpha = None
+        self._edge_dark = None
+
+        if self._transform is None:
+            source_x, source_y = window_x, window_y
+        else:
+            placement = self._transform
+            aspect = transform.SOURCE_ASPECT
+            radians = np.radians(placement.angle)
+            cos, sin = np.cos(radians), np.sin(radians)
+            ax = (window_x - placement.pivot_x - placement.x) * aspect
+            ay = window_y - placement.pivot_y - placement.y
+            rx = (ax * cos + ay * sin) / max(abs(placement.scale_x), 1e-6)
+            ry = (ay * cos - ax * sin) / max(abs(placement.scale_y), 1e-6)
+            source_x = rx / aspect + placement.pivot_x
+            source_y = ry + placement.pivot_y
+            if placement.flip_h:
+                source_x = 1.0 - source_x
+            if placement.flip_v:
+                source_y = 1.0 - source_y
+
+            left, top, right, bottom = placement.kept
+            if placement.edge == 2:
+                source_x = np.clip(source_x, left, right)
+                source_y = np.clip(source_y, top, bottom)
+            else:
+                # One source pixel wide, which is all this renderer's bilinear
+                # gather can resolve -- the GPU fades over the baked footprint
+                # instead, so their edges differ by well under a pixel.
+                span_x = 1.0 / max(self.source_width * abs(placement.scale_x), 1.0)
+                span_y = 1.0 / max(self.source_height * abs(placement.scale_y), 1.0)
+                cover = (np.clip((source_x - left) / span_x + 0.5, 0.0, 1.0)
+                         * np.clip((right - source_x) / span_x + 0.5, 0.0, 1.0)
+                         * np.clip((source_y - top) / span_y + 0.5, 0.0, 1.0)
+                         * np.clip((bottom - source_y) / span_y + 0.5, 0.0, 1.0))
+                cover = cover.astype(np.float32)
+                if placement.edge == 1:
+                    self._edge_dark = cover[..., None]
+                else:
+                    self._edge_alpha = cover
+
+        self.map_x = (source_x * self.source_width - 0.5).astype(np.float32)
+        self.map_y = (source_y * self.source_height - 0.5).astype(np.float32)
+        self.coverage = self.table.coverage[..., None]
+
     def set_supersample(self, on: bool) -> None:
         pass                      # the CPU path has no room to spare for it
 
     def set_overlay(self, image) -> None:
-        pass                      # the fallback draws the frame only
+        pass                      # the fallback draws the picture only
+
+    def set_frame_plane(self, image) -> None:
+        pass
+
+    def set_frame_fit(self, fit: bool) -> None:
+        pass
 
     def set_overlay_opacity(self, opacity: float) -> None:
         pass
@@ -949,6 +1160,8 @@ class CpuRemapper:
             warped = bilinear_gather(linear, self.map_x, self.map_y)
 
         alpha = self.table.coverage
+        if self._edge_alpha is not None:
+            alpha = alpha * self._edge_alpha
         if self.source_alpha != ALPHA_IGNORE:
             plane = frame[..., 3].astype(np.float32) / 255.0
             if self.cv2 is not None:
@@ -960,6 +1173,8 @@ class CpuRemapper:
                                           self.map_y)[..., 0]
             alpha = alpha * carried
 
+        if self._edge_dark is not None:
+            warped *= self._edge_dark
         if self.premultiplied:
             warped *= alpha[..., None]
         index = np.clip(warped * (self.steps - 1), 0, self.steps - 1).astype(np.int32)

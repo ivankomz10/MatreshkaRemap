@@ -54,6 +54,7 @@ echo "==> building"
     --add-data "$HERE/tables/table_quarter.npz:." \
     --add-data "$HERE/tables/screen_geometry.npz:." \
     --add-data "$HERE/tables/viewer_table.npz:." \
+    --add-data "$HERE/icons:icons" \
     --exclude-module PySide6.QtWebEngineCore \
     --exclude-module PySide6.QtWebEngineWidgets \
     --exclude-module PySide6.QtQuick \

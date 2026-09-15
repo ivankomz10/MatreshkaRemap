@@ -25,7 +25,9 @@ ARCHIVE = HERE / "MatreshkaRemapRenderer_mac.zip"
 
 # What the application itself reaches, worked out from main.py's imports.
 APP = ["main", "app_jobs", "avio", "constants", "depends", "imagefile",
-       "logfile", "preview3d", "remap_engine", "remap_render", "scan"]
+       "logfile", "preview3d", "remap_engine", "remap_render", "scan",
+       "transform", "transform_ui", "icons", "gizmo", "framecache",
+       "presets"]
 # Not built in, but they are how the tables were made and belong beside them.
 BAKES = ["bake_geometry", "bake_tables"]
 TABLES = ["table_full.npz", "table_half.npz", "table_quarter.npz",
@@ -39,6 +41,10 @@ def sync() -> None:
     for name in APP + BAKES:
         shutil.copy2(TOOL / f"{name}.py", MAC / f"{name}.py")
     shutil.copy2(TOOL / "requirements.txt", MAC / "requirements.txt")
+    art = MAC / "icons"
+    art.mkdir(exist_ok=True)
+    for picture in (TOOL / "icons").glob("*.png"):
+        shutil.copy2(picture, art / picture.name)
     (MAC / "tables").mkdir(exist_ok=True)
     for name in TABLES:
         shutil.copy2(TOOL / "tables" / name, MAC / "tables" / name)

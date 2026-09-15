@@ -43,6 +43,9 @@ datas = [
     (os.path.join(TOOL, "tables", "screen_geometry.npz"), "."),
     (os.path.join(TOOL, "tables", "viewer_table.npz"), "."),
 ]
+# The icon set, as a folder: it is looked for by name at run time, so it has to
+# arrive as one rather than as files scattered into the root.
+datas += [(os.path.join(TOOL, "icons"), "icons")]
 
 a = Analysis(
     [os.path.join(TOOL, "main.py")],

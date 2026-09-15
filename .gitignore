@@ -70,10 +70,25 @@ dist/
 *.blend2
 
 # Written by the application while it runs, not a setting anyone edits.
-# tool/remap_tool.json — the shipped default — stays tracked.
-/remap_tool.json
+# tool/remap_tool.json -- the shipped default, three lines of it -- stays
+# tracked. The one beside the .blend holds the framing aimed on every clip,
+# which is work, and so are the rolling backups beside it.
+/remap_tool.json*
+/remap_presets.json*
 /ui_span.txt
 *.log
+
+
+# --- Generated beside the source --------------------------------------------
+# pack_mac.py copies tool/icons here the same way it copies the tables.
+/mac_build/icons/
+
+# The checks write their fixtures here -- a short sequence, a few stills, and
+# the copy of remap_tool.json they put back afterwards.
+/tool/tests/_scratch/
+
+# A Blender render, 25 MB of it. Output, like everything in OUT.
+/Blender_OUT_Render.png
 
 
 # --- Stray -------------------------------------------------------------------

@@ -12,16 +12,20 @@ import time
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QRectF, QSize, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import (QEvent, QPointF, QRectF, QSize, Qt, QTimer,
+                            QUrl, Signal)
 from PySide6.QtGui import (QBrush, QColor, QDesktopServices, QFont, QImage,
-                           QPainter, QPainterPath, QPen, QPixmap)
+                           QKeySequence, QPainter, QPainterPath, QPalette,
+                           QPen, QPixmap)
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox,
-    QDialog, QFileDialog,
+    QDialog, QFileDialog, QInputDialog, QMenu,
     QFrame, QGraphicsPixmapItem, QGraphicsScene, QGraphicsView, QGridLayout,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
     QPlainTextEdit, QProgressBar, QPushButton, QRadioButton, QScrollArea,
-    QSizePolicy, QSlider, QSpinBox, QSplitter, QStackedWidget, QTableWidget,
+    QSizePolicy, QSlider, QSpinBox, QSplitter, QStackedWidget, QStyle,
+    QTabWidget,
+    QTableWidget,
     QTableWidgetItem,
     QVBoxLayout, QWidget,
 )
@@ -29,11 +33,17 @@ from PySide6.QtWidgets import (
 import app_jobs
 import constants
 import depends
+import framecache
 import imagefile
 import logfile
 import preview3d
+import gizmo
+import icons
+import presets
 import remap_engine
 import remap_render
+import transform as xf
+import transform_ui
 import scan
 
 IDLE_NOTE = "Ready. Drop a frame on the preview, or scrub the timeline."
@@ -258,6 +268,21 @@ class ImageView(QGraphicsView):
 
     fileDropped = Signal(str)
     modeChanged = Signal(int)
+    gizmoMoved = Signal()
+    gizmoGrabbed = Signal()          # a handle was taken hold of, once
+    nudged = Signal(int, int)        # by this many pixels of the source frame
+    stepped = Signal(int)            # by this many frames along the timeline
+
+    # Drawn in the corner and answered by keyPressEvent. One list, so a key
+    # that works and a key that is advertised cannot drift apart.
+    KEYS = [
+        ("arrows", "move the clip"),
+        ("shift + arrows", "ten pixels"),
+        ("F", "fit the view"),
+        ("1", "one to one"),
+        (", .", "step a frame"),
+        ("space", "play or stop"),
+    ]
 
     MODES = ["Flat", "Viewer"]
 
@@ -278,6 +303,7 @@ class ImageView(QGraphicsView):
         self.setMinimumSize(QSize(420, 260))
         self.setAcceptDrops(True)
         self.viewport().setAcceptDrops(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self._normal_frame = self.styleSheet()
 
         self.modes = QComboBox(self)
@@ -294,6 +320,11 @@ class ImageView(QGraphicsView):
         # Black content and no content look the same over a dark background,
         # which is exactly the pair worth telling apart when a frame carries
         # its own matte. Two mid greys read against both.
+        # Aiming happens over the warped picture rather than beside it: the
+        # handles are drawn where the clip's corners actually landed, and what
+        # is under the cursor is read back out of the same baked table.
+        self.gizmo = gizmo.Gizmo()
+
         self._checker = QPixmap(24, 24)
         self._checker.fill(QColor("#4a4a4a"))
         brush = QPainter(self._checker)
@@ -305,6 +336,129 @@ class ImageView(QGraphicsView):
     def set_checker(self, on: bool) -> None:
         self._show_checker = bool(on)
         self.viewport().update()
+
+    # -- the transform handles ---------------------------------------------
+
+    def show_gizmo(self, placement, window_map, visible: bool) -> None:
+        self.gizmo.placement = placement
+        self.gizmo.map = window_map
+        self.gizmo.visible = visible and window_map is not None
+        self.viewport().update()
+
+    def _zoom(self) -> float:
+        """Scene pixels to screen pixels, so a grab radius means the same thing
+        however far in someone has come."""
+        return max(abs(self.transform().m11()), 1e-6)
+
+    def _map_ratio(self) -> float:
+        """Map pixels per pixel of the picture actually on screen.
+
+        These are not the same number and assuming they were is what broke
+        aiming on the flat frame. The warp drops to a quarter while a handle is
+        held -- four times less work, so the picture keeps up with the hand --
+        but the table the handles are computed against is the full one. So the
+        frame under the cursor was 1152 wide while every handle was placed and
+        every drag measured as though it were 4608: the box was drawn four
+        times too far out and the drag ran at a quarter rate.
+
+        The camera view never showed it. That gather always writes the viewer
+        table's own size whatever it was fed, so its picture and its map have
+        always agreed, which is why one of the two views looked merely wrong
+        and the other looked broken.
+        """
+        pixmap = self._item.pixmap()
+        if self.gizmo.map is None or pixmap.isNull() or pixmap.width() <= 0:
+            return 1.0
+        return self.gizmo.map.width / pixmap.width()
+
+    def _screen_point(self, spot) -> QPointF:
+        """A point of the map, where it lands on the screen."""
+        ratio = self._map_ratio()
+        return self.mapFromScene(QPointF(spot[0] / ratio, spot[1] / ratio))
+
+    def _turn_spot(self) -> QPointF | None:
+        """The rotation handle: a fixed distance above the pivot, on screen.
+
+        In the window it would be an arm of a certain length; here the picture
+        is bent, and an arm that follows the bend points somewhere useless. A
+        screen-space affordance over a screen-space drag, with the angle worked
+        out in the window where it means something.
+        """
+        spots = self.gizmo.handles()
+        if "pivot" not in spots:
+            return None
+        pivot = self._screen_point(spots["pivot"])
+        return QPointF(pivot.x(), pivot.y() - gizmo.TURN_ARM)
+
+    def drawForeground(self, painter, rect) -> None:  # noqa: N802 -- Qt naming
+        super().drawForeground(painter, rect)
+        self._draw_keys(painter)
+        if not self.gizmo.visible or self._item.pixmap().isNull():
+            return
+        painter.save()
+        painter.resetTransform()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(QColor("#e0b050"), 1.3, Qt.PenStyle.DashLine))
+        for run in self.gizmo.outline():
+            path = QPainterPath(self._screen_point(run[0]))
+            for point in run[1:]:
+                path.lineTo(self._screen_point(point))
+            painter.drawPath(path)
+
+        spots = self.gizmo.handles()
+        turn = self._turn_spot()
+        painter.setPen(QPen(QColor("#20201c"), 1.0))
+        painter.setBrush(QBrush(QColor("#e0b050")))
+        for name, spot in spots.items():
+            if name == "pivot":
+                continue
+            point = self._screen_point(spot)
+            painter.drawRect(QRectF(point.x() - gizmo.HANDLE / 2,
+                                    point.y() - gizmo.HANDLE / 2,
+                                    gizmo.HANDLE, gizmo.HANDLE))
+        if turn is not None and "pivot" in spots:
+            pivot = self._screen_point(spots["pivot"])
+            painter.setPen(QPen(QColor("#e0b050"), 1.2))
+            painter.setBrush(QBrush(QColor("#e0b050")))
+            painter.drawLine(pivot, turn)
+            painter.drawEllipse(turn, gizmo.HANDLE / 2 + 1, gizmo.HANDLE / 2 + 1)
+
+        if "pivot" in spots:
+            pivot = self._screen_point(spots["pivot"])
+            caught = self.gizmo.snapped is not None
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(QColor("#7fd07f" if caught else "#f4f4f4"), 1.5))
+            painter.drawEllipse(pivot, gizmo.HANDLE, gizmo.HANDLE)
+            painter.drawLine(QPointF(pivot.x() - gizmo.HANDLE - 5, pivot.y()),
+                             QPointF(pivot.x() + gizmo.HANDLE + 5, pivot.y()))
+            painter.drawLine(QPointF(pivot.x(), pivot.y() - gizmo.HANDLE - 5),
+                             QPointF(pivot.x(), pivot.y() + gizmo.HANDLE + 5))
+        painter.restore()
+
+    def _draw_keys(self, painter) -> None:
+        """The shortcuts, down the bottom left, faint enough to ignore.
+
+        A key nobody knows about is a key nobody presses, and a manual nobody
+        opens is worse than a corner of the picture nobody was using.
+        """
+        painter.save()
+        painter.resetTransform()
+        metrics = painter.fontMetrics()
+        line = metrics.height()
+        widest = max(metrics.horizontalAdvance(name) for name, _ in self.KEYS)
+        bottom = self.viewport().height() - 10
+        top = bottom - line * len(self.KEYS)
+
+        ink = self.palette().color(QPalette.ColorRole.WindowText)
+        faint = QColor(ink.red(), ink.green(), ink.blue(), 120)
+        painter.setPen(faint)
+        for index, (name, what) in enumerate(self.KEYS):
+            y = top + index * line + metrics.ascent()
+            painter.drawText(12, y, name)
+            painter.drawText(12 + widest + 10, y, what)
+        painter.restore()
 
     def drawBackground(self, painter, rect) -> None:  # noqa: N802 -- Qt naming
         """The frame's own footprint, tiled, so transparency is visible.
@@ -322,20 +476,124 @@ class ImageView(QGraphicsView):
         painter.fillRect(area, QBrush(self._checker))
         painter.restore()
 
+    # -- dragging the handles ----------------------------------------------
+
+    def _frame_point(self, position) -> tuple[float, float]:
+        """Where the cursor is, in the pixels the gizmo's map is written in."""
+        spot = self.mapToScene(position.toPoint())
+        ratio = self._map_ratio()
+        return spot.x() * ratio, spot.y() * ratio
+
+    def _on_press(self, event) -> None:
+        """A handle first, panning second. Nothing else changes."""
+        if (event.button() != Qt.MouseButton.LeftButton
+                or not self.gizmo.visible or self._item.pixmap().isNull()):
+            super().mousePressEvent(event)
+            return
+        turn = self._turn_spot()
+        if turn is not None and (turn - event.position()).manhattanLength() <= gizmo.GRAB * 2:
+            self.gizmo.grab(*self._frame_point(event.position()), 0.0)
+            self._turning = True
+            self.gizmoGrabbed.emit()
+            event.accept()
+            return
+        self._turning = False
+        # The grab radius is given in screen pixels and spent in map ones.
+        held = self.gizmo.grab(*self._frame_point(event.position()),
+                               gizmo.GRAB * self._map_ratio() / self._zoom())
+        if held is None:
+            super().mousePressEvent(event)
+            return
+        self.gizmoGrabbed.emit()
+        self.setDragMode(QGraphicsView.DragMode.NoDrag)
+        event.accept()
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if not self.gizmo.holding():
+            super().mouseMoveEvent(event)
+            return
+        keys = event.modifiers()
+        point = self._frame_point(event.position())
+        shift = bool(keys & Qt.KeyboardModifier.ShiftModifier)
+        ctrl = bool(keys & Qt.KeyboardModifier.ControlModifier)
+        moved = (self.gizmo.turn(*point, ctrl) if getattr(self, "_turning", False)
+                 else self.gizmo.drag(*point, shift, ctrl,
+                                      gizmo.SNAP_PULL * self._map_ratio() / self._zoom()))
+        if moved:
+            self.gizmoMoved.emit()
+            self.viewport().update()
+        event.accept()
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if self.gizmo.holding():
+            self.gizmo.release()
+            self.gizmoMoved.emit()          # once more, at full size
+            self._turning = False
+            self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+            self.viewport().update()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802 -- Qt naming
+        """Nudging and stepping, for the hand that is already on the picture."""
+        key = event.key()
+        far = 10 if event.modifiers() & Qt.KeyboardModifier.ShiftModifier else 1
+        arrows = {Qt.Key.Key_Left: (-1, 0), Qt.Key.Key_Right: (1, 0),
+                  Qt.Key.Key_Up: (0, -1), Qt.Key.Key_Down: (0, 1)}
+        if key in arrows:
+            across, down = arrows[key]
+            self.nudged.emit(across * far, down * far)
+            event.accept()
+            return
+        if key == Qt.Key.Key_F:
+            self.fit()
+        elif key == Qt.Key.Key_1:
+            self.actual_size()
+        elif key == Qt.Key.Key_Comma:
+            self.stepped.emit(-far)
+        elif key == Qt.Key.Key_Period:
+            self.stepped.emit(far)
+        else:
+            super().keyPressEvent(event)
+            return
+        event.accept()
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        # Clicking the picture is how the keyboard gets here.
+        self.setFocus(Qt.FocusReason.MouseFocusReason)
+        self._on_press(event)
+
     def set_pixmap(self, pixmap: QPixmap) -> None:
         """Show a frame, keeping whatever zoom is already set.
 
         Scrubbing replaces the picture many times a second, and refitting each
-        time would throw away the close look someone had just taken. A frame of
-        a different shape is a different picture, so that one is fitted.
+        time would throw away the close look someone had just taken.
+
+        The same frame warped at another size is still the same picture, and
+        it arrives whenever the resolution is changed and twice on every drag,
+        because a held handle warps at a quarter. Refitting there threw the
+        view about at the first touch of a corner and again on letting go.
+        So a picture whose proportions have not changed keeps its place: the
+        zoom is multiplied by however much the frame shrank, and the scene
+        point that was in the middle is put back in the middle. A frame of
+        genuinely different proportions is a different picture, and is fitted.
         """
-        same_shape = (not self._item.pixmap().isNull()
-                      and self._item.pixmap().size() == pixmap.size())
+        was = self._item.pixmap().size()
+        middle = self.mapToScene(self.viewport().rect().center())
         self._item.setPixmap(pixmap)
         self._scene.setSceneRect(self._item.boundingRect())
         self._rescale_overlay()
-        if not same_shape:
-            self.fit()
+        if was == pixmap.size():
+            return
+        if (was.width() > 0 and pixmap.width() > 0
+                and abs(was.width() / was.height()
+                        - pixmap.width() / pixmap.height()) < 0.01):
+            across = was.width() / pixmap.width()
+            self.scale(across, was.height() / pixmap.height())
+            self.centerOn(middle.x() / across, middle.y() / across)
+            return
+        self.fit()
 
     def set_overlay(self, pixmap: QPixmap) -> None:
         self._overlay.setPixmap(pixmap)
@@ -584,6 +842,7 @@ class Timeline(QWidget):
         self._value = 0
         self._range_start = 0
         self._range_end = 0
+        self._warm: tuple[int, int] | None = None
         self._dragging = False
         self.setMinimumHeight(58)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -608,6 +867,12 @@ class Timeline(QWidget):
     def set_render_range(self, start: int, end: int) -> None:
         self._range_start, self._range_end = start, end
         self.update()
+
+    def set_warm(self, span: tuple[int, int] | None) -> None:
+        """The run of frames sitting in memory, drawn under the track."""
+        if span != self._warm:
+            self._warm = span
+            self.update()
 
     def value(self) -> int:
         return self._value
@@ -694,6 +959,15 @@ class Timeline(QWidget):
         painter.drawRoundedRect(QRectF(band_left, track_top, max(2.0, band_right - band_left),
                                        self.TRACK_HEIGHT), 3, 3)
 
+        if self._warm is not None:
+            # A thin line under the track: what can be played without waiting.
+            first, last = self._warm
+            left, right = self._x_of(first), self._x_of(last)
+            painter.setBrush(QColor("#6fae6f"))
+            painter.drawRoundedRect(
+                QRectF(left, track_top + self.TRACK_HEIGHT + 1,
+                       max(2.0, right - left), 3), 1.5, 1.5)
+
         # end labels
         painter.setPen(QColor("#8a8a8a"))
         painter.setFont(QFont(UI_FONTS, 8))
@@ -723,6 +997,35 @@ class Timeline(QWidget):
         painter.drawText(QRectF(left, 2, width, 18), Qt.AlignmentFlag.AlignCenter, text)
 
 
+class _DropRow(QWidget):
+    """A row that takes a file dragged onto it.
+
+    Qt gives drops to whichever widget is under the pointer, and a row made of
+    a field and three buttons has no single one -- so the row itself takes them
+    and its children are told to keep out of the way.
+    """
+
+    def __init__(self, on_drop) -> None:
+        super().__init__()
+        self.on_drop = on_drop
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802 -- Qt naming
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dragMoveEvent(self, event) -> None:  # noqa: N802
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event) -> None:  # noqa: N802
+        for url in event.mimeData().urls():
+            if url.isLocalFile():
+                self.on_drop(Path(url.toLocalFile()))
+                event.acceptProposedAction()
+                return
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -734,6 +1037,32 @@ class MainWindow(QMainWindow):
         # What Auto made of this source's alpha. None until asked, because
         # asking costs a decode; cleared whenever the source changes.
         self._detected_alpha: str | None = None
+        self._frame_path: Path | None = None
+        self._frame_still = None
+        self._frame_movie: Path | None = None
+        self._frame_sequence = None
+        self._frame_cache: tuple = (None, None)
+        # The window map for whatever the viewport is showing, built once per
+        # table and kept: it is what puts the handles where the corners went.
+        self._maps: dict[str, object] = {}
+        # One placement per source, by file name. Read once here rather than
+        # per frame, and written back whenever one changes.
+        self._placements: dict[str, dict] = dict(
+            constants.load_settings().get("transforms", {}))
+        self._history = xf.History()
+        # Decoded source frames, so playback costs a warp and nothing else.
+        self._cache = framecache.FrameCache()
+        self._warm_job = None
+        self._play_from = 0
+        self._playing = False
+        self._play_at = 0.0                # where in the range, in seconds
+        self._play_timer = QTimer(self)
+        self._play_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._play_timer.timeout.connect(self._play_tick)
+        # What the framing was before whatever is happening now. The panel
+        # edits its transform in place, so by the time it says so the old
+        # numbers are gone -- this is the copy kept to put back.
+        self._before_edit = xf.Transform()
         self.filename_edited = False
         self._named_for = ""            # the sequence that name was made from
         self.preview = app_jobs.PreviewRenderer()
@@ -748,6 +1077,7 @@ class MainWindow(QMainWindow):
         # A dropped image outranks the timeline until the timeline is used
         # again: it is what the preview shows, so it is what Snapshot writes.
         self._dropped: Path | None = None
+        self._dropped_size: tuple[int, int] | None = None
         self._preview_buffer = None
         self._flat_frame = None
         self._overlay_array = None
@@ -814,6 +1144,7 @@ class MainWindow(QMainWindow):
         self._build_source_section(left_layout)
         self._build_range_section(left_layout)
         self._build_resolution_section(left_layout)
+        self._build_frame_section(left_layout)
         self._build_output_section(left_layout)
         left_layout.addStretch(1)
 
@@ -821,24 +1152,65 @@ class MainWindow(QMainWindow):
         scroller.setWidget(left)
         scroller.setWidgetResizable(True)
         scroller.setFrameShape(QFrame.Shape.NoFrame)
-        scroller.setMinimumWidth(560)
         scroller.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
+        # Two tabs rather than a panel that slides over the picture. Aiming and
+        # setting up a render are two jobs, done at different times, and giving
+        # each the whole column beats giving both half of it.
+        self.panel = transform_ui.TransformPanel()
+        self.panel.changed.connect(self._on_transform_edited)
+        self.panel.fitRequested.connect(self._fit_transform)
+        self.panel.resetRequested.connect(self._reset_transform)
+        self.panel.fill_width()
+        self.panel.extras().addLayout(self._build_preset_row())
+
+        aiming = QScrollArea()
+        aiming.setWidget(self.panel)
+        aiming.setWidgetResizable(True)
+        aiming.setFrameShape(QFrame.Shape.NoFrame)
+        aiming.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+        self.tabs = QTabWidget()
+        self.tabs.addTab(scroller, "Source")
+        self.tabs.addTab(aiming, "Transform")
+        self.tabs.setTabIcon(0, icons.get("browse", 16))
+        self.tabs.setTabIcon(1, icons.get("transform", 16))
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+        # Measured, not chosen: icons and labels change width with the theme
+        # and the font, and a number picked once is a number that goes stale.
+        # Asked again in showEvent, when the style has finally settled.
+        self.tabs.setMinimumWidth(self._left_width(left))
+
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(scroller)
+        splitter.addWidget(self.tabs)
         splitter.addWidget(self._build_preview_panel())
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([560, 760])
+        splitter.setSizes([self.tabs.minimumWidth(), 820])
 
         root = QWidget()
         root_layout = QVBoxLayout(root)
         root_layout.setContentsMargins(0, 0, 0, 0)
         root_layout.setSpacing(0)
         root_layout.addWidget(splitter, 1)
-        root_layout.addWidget(self._build_render_bar())
-        root_layout.addWidget(self._build_log())
+        # Kept by name: fullscreen has to put back exactly what it took away.
+        self.render_bar = self._build_render_bar()
+        self.log_panel = self._build_log()
+        root_layout.addWidget(self.render_bar)
+        root_layout.addWidget(self.log_panel)
         self.setCentralWidget(root)
+
+    def _left_width(self, column) -> int:
+        """What the left column needs to show everything on it.
+
+        Its own width, plus room for the scrollbar that appears the moment it
+        does not fit -- otherwise adding the bar takes away the space that made
+        it necessary, and the last button on every row is clipped by exactly
+        its width.
+        """
+        bar = self.style().pixelMetric(
+            QStyle.PixelMetric.PM_ScrollBarExtent, None, self.scroller)
+        return column.minimumSizeHint().width() + bar + 8
 
     def _build_source_section(self, layout) -> None:
         self._heading("Source", layout)
@@ -866,7 +1238,13 @@ class MainWindow(QMainWindow):
         self.seq_table.setHorizontalHeaderLabels(["Sequence", "Frames", "Range", "Size"])
         self.seq_table.verticalHeader().setVisible(False)
         self.seq_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.seq_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        # More than one row, so a framing can be put on a batch of clips at
+        # once. What the preview shows is the row last touched, which in the
+        # ordinary one-row case is the row selected -- nothing changes there.
+        self.seq_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.seq_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.seq_table.customContextMenuRequested.connect(self._table_menu)
         self.seq_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         header = self.seq_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
@@ -972,6 +1350,150 @@ class MainWindow(QMainWindow):
 
     def _on_checker(self, on: bool) -> None:
         self.view.set_checker(on)
+
+    def _build_frame_section(self, layout) -> None:
+        """Something to aim the content against, drawn over the preview.
+
+        The same idea as the Viewer's Frame row and for the same reason: the
+        content is aimed against something, and a still or a movie with a hole
+        in the middle is what the something usually is.
+
+        It never reaches a render. What goes to the wall is the reprojection
+        and nothing else -- this is a ruler, like the layout map beside it.
+        """
+        self._heading("Frame", layout)
+
+        row = _DropRow(self._load_frame)
+        line = QHBoxLayout(row)
+        line.setContentsMargins(0, 0, 0, 0)
+        line.setSpacing(6)
+
+        self.frame_edit = QLineEdit()
+        self.frame_edit.setReadOnly(True)
+        self.frame_edit.setPlaceholderText(
+            "Drop a picture, a sequence or a movie -- shown over the preview only")
+        # Its own drop target is the row, not the field: a line edit accepts
+        # drops of its own and would swallow the file before the row saw it.
+        self.frame_edit.setAcceptDrops(False)
+        line.addWidget(self.frame_edit, 1)
+
+        pick = QPushButton()
+        pick.setFixedWidth(30)
+        icons.put(pick, "browse", 18)
+        pick.setToolTip("Choose the border")
+        pick.clicked.connect(self._browse_frame)
+        line.addWidget(pick)
+
+        self.frame_fit = QPushButton(" Fit")
+        self.frame_fit.setCheckable(True)
+        icons.put(self.frame_fit, "fit", 18)
+        self.frame_fit.setToolTip(
+            "Keep the border's own shape. Off, it is stretched to the wall.")
+        self.frame_fit.toggled.connect(self._on_frame_fit)
+        line.addWidget(self.frame_fit)
+
+        clear = QPushButton()
+        clear.setFixedWidth(30)
+        icons.put(clear, "clear", 16)
+        clear.setToolTip("Take the border off")
+        clear.clicked.connect(lambda: self._load_frame(None))
+        line.addWidget(clear)
+        for child in (self.frame_edit, pick, self.frame_fit, clear):
+            child.setAcceptDrops(False)
+        layout.addWidget(row)
+
+    def _browse_frame(self) -> None:
+        start = str(constants.PROJECT_DIR)
+        chosen, _ = QFileDialog.getOpenFileName(
+            self, "Choose the border", start,
+            "Pictures and movies (*.png *.tif *.tga *.exr *.jpg *.mov *.mp4 *.mkv)")
+        if chosen:
+            self._load_frame(Path(chosen))
+
+    def _load_frame(self, path: Path | None) -> None:
+        """Take the border, still or moving, or take it away."""
+        self._frame_path = path
+        self._frame_still = None
+        self._frame_movie = None
+        self._frame_sequence = None
+        self._frame_cache = (None, None)
+        if path is None:
+            self.frame_edit.setText("")
+            self._preview_timer.start()
+            return
+        self.frame_edit.setText(constants.display(path))
+        if path.suffix.lower() in scan.VIDEO_EXTENSIONS:
+            self._frame_movie = path
+            self._log(f"frame: {constants.display(path)} (moving)")
+        elif self._frame_series(path) is not None:
+            found = self._frame_series(path)
+            self._frame_sequence = found
+            self.frame_edit.setText(constants.display(found.directory / found.pattern_label))
+            self._log(f"frame: {found.pattern_label}   {len(found.numbers)} frames")
+        else:
+            try:
+                self._frame_still = imagefile.read_rgba(path)
+            except Exception as error:  # noqa: BLE001 -- shown in the window
+                self._note(self.preview_note, f"could not read {path.name}: {error}",
+                           "error")
+                self._frame_path = None
+                self.frame_edit.setText("")
+                return
+            self._log(f"frame: {constants.display(path)}")
+        self._preview_timer.start()
+
+    def _on_frame_fit(self, _fit: bool) -> None:
+        self._preview_timer.start()
+
+    @staticmethod
+    def _frame_series(path: Path):
+        """The numbered sequence this file belongs to, if it belongs to one.
+
+        A border is as often a render as it is a single picture, and dropping
+        one file of a thousand should not mean the other nine hundred and
+        ninety-nine were ignored.
+        """
+        try:
+            for found in scan._scan_one_directory(path.parent):
+                if found.numbers and path.name.startswith(found.prefix)                         and path.suffix == found.extension and len(found.numbers) > 1:
+                    return found
+        except Exception:  # noqa: BLE001 -- a guess, never a step
+            return None
+        return None
+
+    def _frame_image(self, number: int):
+        """The border for this frame: a still stays put, the rest is read.
+
+        A sequence and a movie both loop on their own length: a border is
+        decoration, so it repeats rather than deciding how long anything is.
+        """
+        if self._frame_still is not None:
+            return self._frame_still
+        if self._frame_movie is None and self._frame_sequence is None:
+            return None
+        wanted, cached = self._frame_cache
+        if wanted == number and cached is not None:
+            return cached
+        try:
+            if self._frame_sequence is not None:
+                run = self._frame_sequence
+                place = (max(0, number) - run.first) % len(run.numbers)
+                picture = imagefile.read_rgba(run.path_for(run.numbers[place]))
+            else:
+                owner, _ = app_jobs.avio.read_single_frame(
+                    str(self._frame_movie), False, max(0, number), 0, True)
+                picture = np.ascontiguousarray(owner.to_ndarray(format="rgba"))
+        except Exception:  # noqa: BLE001 -- a border is never worth a failed frame
+            return None
+        self._frame_cache = (number, picture)
+        return picture
+
+    def _dress(self, engine, number: int) -> None:
+        """Put the border on an engine, or take it off."""
+        if not hasattr(engine, "set_frame_plane"):
+            return
+        engine.set_frame_plane(self._frame_image(number))
+        engine.set_frame_fit(self.frame_fit.isChecked())
 
     def _build_output_section(self, layout) -> None:
         self._heading("Output", layout)
@@ -1129,15 +1651,32 @@ class MainWindow(QMainWindow):
         pick_overlay.clicked.connect(self._browse_overlay)
         bar.addWidget(pick_overlay)
         self.overlay_extras.append(pick_overlay)
+
+        drop_overlay = QPushButton()
+        drop_overlay.setFixedWidth(28)
+        icons.put(drop_overlay, "clear", 15)
+        drop_overlay.setToolTip("Back to the map that ships with the tool")
+        drop_overlay.clicked.connect(self._clear_overlay)
+        bar.addWidget(drop_overlay)
+        self.overlay_extras.append(drop_overlay)
         for widget in self.overlay_extras:
             widget.setVisible(False)
 
         bar.addSpacing(10)
-        self.snapshot_button = QPushButton("Snapshot")
+        self.full_button = QPushButton()
+        self.full_button.setCheckable(True)
+        self.full_button.setFixedWidth(30)
+        icons.put(self.full_button, "fullscreen", 18)
+        self.full_button.setToolTip("The picture and nothing else   (F11, Esc to come back)")
+        self.full_button.toggled.connect(self._on_fullscreen)
+        bar.addWidget(self.full_button)
+
+        self.snapshot_button = QPushButton(" Snapshot")
         self.snapshot_button.setToolTip(
             "Save the frame on screen at full resolution into the Snapshots "
             "folder, with transparency where the screen does not cover the frame."
         )
+        icons.put(self.snapshot_button, "snapshot", 18)
         self.snapshot_button.clicked.connect(self._save_snapshot)
         bar.addWidget(self.snapshot_button)
         layout.addLayout(bar)
@@ -1146,16 +1685,24 @@ class MainWindow(QMainWindow):
         self.view.modes.setVisible(False)      # the bar asks this now
         self.view.fileDropped.connect(lambda path: self._handle_drop(Path(path)))
         self.view.modeChanged.connect(self._on_view_mode_changed)
+        self.view.gizmoMoved.connect(self._on_gizmo)
+        self.view.gizmoGrabbed.connect(self._keep_for_undo)
+        self.view.nudged.connect(self._nudge_clip)
+        self.view.stepped.connect(self._step_frame)
         self.scene_view = SceneView()
 
         self.view_stack = QStackedWidget()
         self.view_stack.addWidget(self.view)
         self.view_stack.addWidget(self.scene_view)
+
+        # The panel floats over the picture rather than pushing it, so opening
+        # it does not refit the view and throw away a close look.
         layout.addWidget(self.view_stack, 1)
 
         self.timeline = Timeline()
         self.timeline.frameChanged.connect(self._on_scrub)
         layout.addWidget(self.timeline)
+        layout.addLayout(self._build_transport())
 
         under = QHBoxLayout()
         self.frame_label = QLabel("")
@@ -1177,15 +1724,203 @@ class MainWindow(QMainWindow):
         self.mode_button.toggled.connect(self._on_mode_changed)
         return panel
 
+    def _build_preset_row(self):
+        """Saved framings, and a way to spread the current one about."""
+        rows = QVBoxLayout()
+        rows.setSpacing(4)
+
+        line = QHBoxLayout()
+        line.setSpacing(4)
+        self.preset_box = QComboBox()
+        self.preset_box.setToolTip("Framings saved beside the project")
+        self.preset_box.activated.connect(
+            lambda _index: self._apply_preset(self.preset_box.currentText()))
+        line.addWidget(self.preset_box, 1)
+
+        keep = QPushButton()
+        keep.setFixedWidth(28)
+        keep.setToolTip("Save this framing under a name")
+        icons.put(keep, "browse", 15)
+        keep.clicked.connect(self._save_preset)
+        line.addWidget(keep)
+
+        drop = QPushButton()
+        drop.setFixedWidth(28)
+        drop.setToolTip("Forget the chosen framing")
+        icons.put(drop, "clear", 15)
+        drop.clicked.connect(self._drop_preset)
+        line.addWidget(drop)
+        rows.addLayout(line)
+
+        spread = QPushButton(" Apply to the selected sources")
+        icons.put(spread, "link", 15)
+        spread.setToolTip("Put this framing on every source highlighted in the "
+                          "table. Select several with Ctrl or Shift.")
+        spread.clicked.connect(self._apply_to_selected)
+        rows.addWidget(spread)
+        self._refresh_presets()
+        return rows
+
+    def _build_transport(self):
+        """To the beginning, back, play, on, to the end -- and where we are.
+
+        The same row the Viewer has, and for the same reason: judging motion
+        wants a transport, not a scrub bar. The keyboard does all of it too,
+        but the hand is usually already on the mouse.
+        """
+        bar = QHBoxLayout()
+        bar.setSpacing(4)
+        bar.setContentsMargins(16, 0, 16, 0)
+
+        # Filling memory is its own act, with its own button, rather than
+        # something Play does on the way past. Play then plays what is held,
+        # from wherever the playhead is, and never pushes the warm run about.
+        self.cache_button = QPushButton()
+        self.cache_button.setFixedWidth(34)
+        self.cache_button.setCheckable(True)
+        self.cache_button.setStyleSheet(transform_ui.LIT)
+        self.cache_button.setToolTip(
+            "Hold the range in memory, from its first frame on. "
+            "Press again to stop.")
+        icons.put(self.cache_button, "memory", 16)
+        self.cache_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.cache_button.clicked.connect(self._toggle_warm)
+        bar.addWidget(self.cache_button)
+        bar.addSpacing(12)
+
+        for art, tip, act in (
+                ("first", "To the beginning of the range",
+                 lambda: self.timeline.set_value(self.start_spin.value())),
+                ("back", "Back one frame   (comma)", lambda: self._step_frame(-1)),
+                (None, None, None),
+                ("forward", "On one frame   (full stop)", lambda: self._step_frame(1)),
+                ("last", "To the end of the range",
+                 lambda: self.timeline.set_value(self.end_spin.value()))):
+            if art is None:
+                self.play_button = QPushButton()
+                self.play_button.setFixedWidth(34)
+                self.play_button.setToolTip("Play or stop   (space)")
+                icons.put(self.play_button, "play", 16)
+                self.play_button.clicked.connect(self._toggle_play)
+                bar.addWidget(self.play_button)
+                continue
+            button = QPushButton()
+            button.setFixedWidth(30)
+            button.setToolTip(tip)
+            icons.put(button, art, 15)
+            button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            button.clicked.connect(act)
+            bar.addWidget(button)
+
+        self.loop_button = QPushButton()
+        self.loop_button.setCheckable(True)
+        self.loop_button.setChecked(True)
+        self.loop_button.setFixedWidth(30)
+        self.loop_button.setStyleSheet(transform_ui.LIT)
+        self.loop_button.setToolTip("Go round again at the end of what is warm")
+        icons.put(self.loop_button, "loop", 15)
+        bar.addWidget(self.loop_button)
+
+        bar.addSpacing(10)
+        self.warm_label = QLabel("")
+        self.warm_label.setStyleSheet("color:#6fae6f;")
+        bar.addWidget(self.warm_label)
+        bar.addStretch(1)
+
+        self.time_label = QLabel("")
+        self.time_label.setStyleSheet("color:#8a8a8a;")
+        bar.addWidget(self.time_label)
+        return bar
+
     def _choose_view(self, index: int) -> None:
-        """Flat, Viewer, or the thing standing in the square."""
-        self.view.modes.setCurrentIndex(min(index, 1))
+        """Flat, the view from the camera, or the thing standing in the square."""
+        if index < 2:
+            self.view.modes.setCurrentIndex(index)
         self.mode_button.setChecked(index == 2)
+        for button in self.flat_buttons:
+            button.setVisible(index < 2)
         self._sync_view_buttons()
+
+    def _on_fullscreen(self, going: bool) -> None:
+        """The picture, and nothing beside it.
+
+        What was showing is remembered rather than worked out again on the way
+        back: some of these bars belong to a mode, and restoring them by rule
+        would raise one this mode keeps down.
+        """
+        board = self.centralWidget().layout()
+        if going:
+            self._was_showing = [(widget, widget.isVisible())
+                                 for widget in (self.tabs, self.render_bar,
+                                                self.log_panel)]
+            self._before_full = self.saveGeometry()
+            for widget, _ in self._was_showing:
+                widget.setVisible(False)
+            board.setContentsMargins(0, 0, 0, 0)
+            self.showFullScreen()
+        else:
+            self.showNormal()
+            if getattr(self, "_before_full", None) is not None:
+                self.restoreGeometry(self._before_full)
+            for widget, was in getattr(self, "_was_showing", []):
+                widget.setVisible(was)
+
+    def showEvent(self, event) -> None:  # noqa: N802 -- Qt naming
+        """Repaint the icons once the window is really on screen.
+
+        Whatever the platform theme finally settles on is in force by now, and
+        it is not always what it was when these widgets were built.
+        """
+        super().showEvent(event)
+        if not getattr(self, "_inked", False):
+            self._inked = True
+            icons.refresh()
+            # Icons and fonts are final now, so the column can be measured for
+            # real rather than from what the style guessed while it was empty.
+            column = self.scroller.widget()
+            if column is not None:
+                self.tabs.setMinimumWidth(self._left_width(column))
+
+    def _typing(self) -> bool:
+        """Whether a space belongs to a field rather than to the transport."""
+        spot = QApplication.focusWidget()
+        return isinstance(spot, (QLineEdit, QSpinBox, QComboBox))
+
+    def changeEvent(self, event) -> None:  # noqa: N802 -- Qt naming
+        """Repaint the icons when the theme moves under us.
+
+        Windows can switch between light and dark while an application is
+        running, and an icon tinted once at startup is then drawn in the
+        previous theme's ink -- which on the far side of the switch is the
+        background colour.
+        """
+        if event.type() in (QEvent.Type.PaletteChange,
+                            QEvent.Type.ApplicationPaletteChange):
+            icons.refresh()
+        super().changeEvent(event)
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802 -- Qt naming
+        if event.key() == Qt.Key.Key_Space and not self._typing():
+            self._toggle_play()
+            return
+        if event.matches(QKeySequence.StandardKey.Undo):
+            self._undo()
+            return
+        if event.matches(QKeySequence.StandardKey.Redo):
+            self._undo(forward=True)
+            return
+        if event.key() == Qt.Key.Key_F11:
+            self.full_button.setChecked(not self.full_button.isChecked())
+            return
+        if event.key() == Qt.Key.Key_Escape and self.full_button.isChecked():
+            self.full_button.setChecked(False)
+            return
+        super().keyPressEvent(event)
 
     def _on_view_mode_changed(self, _index: int) -> None:
         self._sync_view_buttons()
         self._present()
+        self._sync_transform_ui()
 
     def _sync_view_buttons(self) -> None:
         """The buttons follow the state, whoever changed it."""
@@ -1214,12 +1949,13 @@ class MainWindow(QMainWindow):
         self.render_button.clicked.connect(self._start_render)
         layout.addWidget(self.render_button)
 
-        self.flipbook_button = QPushButton("Flipbook")
+        self.flipbook_button = QPushButton(" Flipbook")
         self.flipbook_button.setToolTip(
             "Bake the frame range exactly as the preview is showing it -- flat "
             "or the viewer's view, with the layout map if it is on. A snapshot "
             "with a timeline; not the file the wall is fed."
         )
+        icons.put(self.flipbook_button, "flipbook", 18)
         self.flipbook_button.clicked.connect(lambda: self._start_render(flipbook=True))
         layout.addWidget(self.flipbook_button)
 
@@ -1433,9 +2169,21 @@ class MainWindow(QMainWindow):
 
     def _on_sequence_selected(self) -> None:
         self._detected_alpha = None
+        self._forget_cache()
+        # Picking a source is the way back from a dropped file.
+        self._dropped = None
+        self._dropped_size = None
+        if hasattr(self, "panel"):
+            self._sync_transform_ui()
         model = self.seq_table.selectionModel()
         rows = model.selectedRows() if model else []
-        self.current = self.sequences[rows[0].row()] if rows else None
+        # The row the cursor is on, not the first of the selection: dragging a
+        # selection upwards would otherwise show the far end of it.
+        here = model.currentIndex().row() if model else -1
+        if not (0 <= here < len(self.sequences)) or not any(
+                index.row() == here for index in rows):
+            here = rows[0].row() if rows else -1
+        self.current = self.sequences[here] if here >= 0 else None
 
         if self.current is None:
             for spin in (self.start_spin, self.end_spin):
@@ -1680,6 +2428,20 @@ class MainWindow(QMainWindow):
         while it is being dragged. The timer only collapses a burst of moves
         into a single render; it is not there to make it feel fast.
         """
+        self._say_frame(frame)
+        if self.current is None:
+            return
+        if self.live_preview and not self._render_running():
+            self._preview_timer.start()
+
+    def _say_frame(self, frame: int) -> None:
+        """Which frame this is, said in both numberings.
+
+        Its own method because playback moves the handle with its signals
+        blocked -- otherwise every played frame would ask for a render of the
+        frame it had just finished rendering -- and the label would then sit
+        on whatever was showing when playback started.
+        """
         if self.current is None:
             self.frame_label.setText("")
             return
@@ -1689,8 +2451,6 @@ class MainWindow(QMainWindow):
         self.frame_label.setText(
             f"frame {frame:0{self.current.padding}d}   ->   scene frame {scene_frame}{outside}"
         )
-        if self.live_preview and not self._render_running():
-            self._preview_timer.start()
 
     def _load_overlay(self, path: Path | None) -> None:
         """Point the preview overlay at an image, or clear it."""
@@ -1749,6 +2509,19 @@ class MainWindow(QMainWindow):
         self._present()
         self._remember_overlay()
 
+    def _clear_overlay(self) -> None:
+        """Off, and back to the bundled layout map.
+
+        Not the same as unticking Overlay: that hides it and keeps the choice,
+        this forgets a hand-picked file so the next launch does not go looking
+        for something that has since moved.
+        """
+        self.overlay_check.setChecked(False)
+        self.overlay_is_custom = False
+        self._load_overlay(constants.overlay_path())
+        self._remember_overlay()
+        self._note(self.preview_note, "overlay back to the map that ships with the tool")
+
     def _remember_overlay(self) -> None:
         settings = constants.load_settings()
         # Only a hand-picked file is worth storing. The bundled Check.png lives
@@ -1770,20 +2543,30 @@ class MainWindow(QMainWindow):
         self._pending_drop = None
         self._warn_if_cold()
         try:
-            owner, planes = app_jobs.avio.read_single_frame(str(path), True, 0, 0)
+            # Whole frames: a dropped still is one decode either way, and this
+            # is the path that lets a PNG with a hole in it stay one.
+            owner, _planes = app_jobs.avio.read_single_frame(str(path), True, 0, 0, True)
+            pixels = owner.to_ndarray(format="rgba")
             started = time.monotonic()
-            engine = self.preview.engine(self._resolution_name(),
+            # Its own placement, which needs to be in place before the render.
+            self._dropped, self._dropped_size = path, (owner.width, owner.height)
+            engine = self.preview.engine(self._preview_resolution(),
                                          (owner.width, owner.height))
             engine.set_premultiplied(True)
+            if hasattr(engine, "set_source_alpha"):
+                engine.set_source_alpha(remap_render.alpha_setting(
+                    remap_render.alpha_convention_of(pixels)))
+            if hasattr(engine, "set_transform"):
+                engine.set_transform(self._placement())
+            self._dress(engine, self.timeline.value())
             if hasattr(engine, "set_output_yuv"):
                 engine.set_output_yuv(False)
-            image = engine.render(planes if engine.name == "GPU"
-                                  else owner.to_ndarray(format="rgba"))
+            image = engine.render(pixels)
         except Exception as error:  # noqa: BLE001 -- shown in the window
             self._note(self.preview_note, str(error), "error")
             return
 
-        self._dropped = path
+        self._sync_transform_ui()
         self._update_render_enabled()
         self._show_array(image)
         width, height = self._output_resolution()
@@ -1804,18 +2587,48 @@ class MainWindow(QMainWindow):
             QApplication.processEvents()
 
     def _do_preview(self) -> None:
-        """Render the frame the timeline handle is sitting on."""
-        if self.current is None or self._render_running():
+        """Render whatever is on screen: a dropped still, or the frame the
+        timeline handle is sitting on.
+
+        The dropped still is asked about first, and that ordering is the whole
+        of it. This used to give up on `self.current is None` before it looked
+        at what had been dropped -- so with no sequence open, which is the
+        state the program is in when someone starts it and drags one picture
+        onto the viewport, the first render happened and no other one ever
+        did. The numbers moved, the handles moved, the picture did not, and
+        the transform editor looked dead.
+        """
+        if self._render_running():
+            return
+        if self._dropped is not None:
+            # Something was dropped on the viewport and has not been replaced.
+            # Scrubbing used to throw it away and quietly put the sequence
+            # back, which looked like the drop had failed a moment late.
+            self.preview_single_frame(self._dropped)
+            return
+        if self.current is None:
             return
         frame = self.timeline.value()
-        self._dropped = None
-        self._warn_if_cold()
         started = time.monotonic()
+        if self._show_cached(frame):
+            # Warmed frames are warm for everything, not only for playback.
+            # Going back to the file for one already in memory was the whole
+            # of the delay when scrubbing over a cached range.
+            self._note(self.preview_note,
+                       f"{self._output_resolution()[0]} x "
+                       f"{self._output_resolution()[1]}   |   "
+                       f"{1000 * (time.monotonic() - started):.0f} ms   |   cached")
+            return
+        self._warn_if_cold()
         try:
+            self._dress(self.preview.engine(self._preview_resolution(),
+                                            (self.current.width, self.current.height)),
+                        frame)
             image = self.preview.render(
-                self.current, frame, self._resolution_name(),
+                self.current, frame, self._preview_resolution(),
                 self.supersample_check.isChecked(),
-                remap_render.alpha_setting(self._source_alpha()))
+                remap_render.alpha_setting(self._source_alpha()),
+                self._placement())
         except Exception as error:  # noqa: BLE001 -- shown in the window
             self._note(self.preview_note, str(error), "error")
             return
@@ -1829,7 +2642,6 @@ class MainWindow(QMainWindow):
             f"{width} x {height}   |   {1000 * (time.monotonic() - started):.0f} ms",
         )
         self._note_engine()
-
     def _viewing_from_camera(self) -> bool:
         """True when the flat viewport is showing the view from the camera."""
         return (self.view.modes.currentIndex() == 1
@@ -1887,6 +2699,9 @@ class MainWindow(QMainWindow):
             engine.set_premultiplied(viewer)
             if hasattr(engine, "set_source_alpha"):
                 engine.set_source_alpha(alpha_mode)
+            if hasattr(engine, "set_transform"):
+                engine.set_transform(self._placement())
+            self._dress(engine, frame if dropped is None else 0)
             if hasattr(engine, "set_output_yuv"):
                 engine.set_output_yuv(False)
             if not viewer and opacity > 0.0:
@@ -1899,6 +2714,8 @@ class MainWindow(QMainWindow):
             engine.set_premultiplied(True)           # the window wants it back
             if hasattr(engine, "set_source_alpha"):
                 engine.set_source_alpha(remap_engine.ALPHA_IGNORE)
+            if hasattr(engine, "set_transform"):
+                engine.set_transform(None)
             engine.set_overlay_opacity(0.0)
             engine.set_overlay_space(False)
 
@@ -2048,8 +2865,503 @@ class MainWindow(QMainWindow):
 
     def _on_source_alpha(self) -> None:
         self._detected_alpha = None
+        self._forget_cache()
         self._note(self.source_note, "")
         self._preview_timer.start()
+
+    # -- where the clip sits ------------------------------------------------
+
+    def _source_key(self) -> str:
+        """What a placement is remembered against."""
+        if self._dropped is not None:
+            return self._dropped.name
+        if self.current is None:
+            return ""
+        return f"{self.current.name}{self.current.extension}"
+
+    def _placement(self) -> xf.Transform:
+        """The transform for whatever is on screen, made on first use.
+
+        Material nobody has aimed yet opens fitted rather than stretched. On a
+        clip already shaped like the wall's picture that is the identity and
+        nothing changes; on anything else it is the difference between seeing
+        the content and seeing it squeezed.
+        """
+        key = self._source_key()
+        if not key:
+            return xf.Transform()
+        stored = self._placements.get(key)
+        if stored is not None:
+            return xf.Transform.from_dict(stored)
+        alike = self._like_this_shape()
+        if alike is not None:
+            return alike
+        width, height = self._source_shape()
+        return xf.Transform().fitted(width, height, False)
+
+    def _source_shape(self) -> tuple[int, int]:
+        if self._dropped is not None and self._dropped_size is not None:
+            return self._dropped_size
+        if self.current is None:
+            return (0, 0)
+        return (self.current.width, self.current.height)
+
+    def _store_placement(self, placement: xf.Transform,
+                         key: str | None = None) -> None:
+        key = key or self._source_key()
+        if not key:
+            return
+        if placement.is_default:
+            self._placements.pop(key, None)      # nothing worth remembering
+        else:
+            state = placement.to_dict()
+            # The shape it was aimed against, so another clip of the same shape
+            # can start where this one ended. Ignored by Transform.from_dict.
+            width, height = self._source_shape()
+            if width > 0 and height > 0:
+                state["aspect"] = width / height
+            self._placements.pop(key, None)      # and back on the end, so the
+            self._placements[key] = state        # newest is findable as newest
+        settings = constants.load_settings()
+        settings["transforms"] = self._placements
+        constants.save_settings(settings)
+
+    def _like_this_shape(self) -> xf.Transform | None:
+        """The last framing aimed at a source of this shape, if there was one.
+
+        By aspect and not by size: 1920 x 1080 and 3840 x 2160 are the same
+        picture, and the numbers are kept as fractions of the frame, so one
+        lands on the other exactly.
+        """
+        width, height = self._source_shape()
+        if width <= 0 or height <= 0:
+            return None
+        wanted = width / height
+        for state in reversed(list(self._placements.values())):
+            aspect = state.get("aspect")
+            if aspect and abs(aspect - wanted) <= wanted * 0.005:
+                return xf.Transform.from_dict(state)
+        return None
+
+    def _nudge_clip(self, across: int, down: int) -> None:
+        """Arrow keys, in pixels of the source frame.
+
+        The same units the panel shows, so pressing right four times and typing
+        a four into the position field are the same act.
+        """
+        width, height = self._source_shape()
+        if width <= 0 or height <= 0:
+            return
+        self._keep_for_undo()
+        placement = self._placement()
+        placement.x += across / width
+        placement.y += down / height
+        self._store_placement(placement)
+        self._sync_transform_ui()
+        self._preview_timer.start()
+
+    def _step_frame(self, by: int) -> None:
+        self.timeline.set_value(self.timeline.value() + by)
+
+    # -- putting one framing on many ------------------------------------------
+
+    def _selected_sources(self) -> list:
+        """Every source highlighted in the table, in the order they are listed."""
+        model = self.seq_table.selectionModel()
+        if model is None:
+            return []
+        rows = sorted(index.row() for index in model.selectedRows())
+        return [self.sequences[row] for row in rows if 0 <= row < len(self.sequences)]
+
+    @staticmethod
+    def _key_of(item) -> str:
+        return f"{item.name}{item.extension}"
+
+    def _apply_to_selected(self) -> None:
+        """Put the framing on screen onto every other clip that is selected."""
+        chosen = self._selected_sources()
+        if len(chosen) < 2:
+            self._note(self.preview_note,
+                       "select more than one source to spread a framing", "warn")
+            return
+        placement = self._placement()
+        mine = self._source_key()
+        done = 0
+        for item in chosen:
+            key = self._key_of(item)
+            if key == mine:
+                continue
+            # Each clip keeps its own shape, so the framing is stored against
+            # that shape rather than against the one it was aimed on.
+            state = placement.to_dict()
+            if item.width and item.height:
+                state["aspect"] = item.width / item.height
+            self._placements.pop(key, None)
+            self._placements[key] = state
+            done += 1
+        settings = constants.load_settings()
+        settings["transforms"] = self._placements
+        constants.save_settings(settings)
+        self._note(self.preview_note, f"framing put on {done} more source(s)")
+        self._log(f"framing applied to {done} source(s)")
+
+    def _save_preset(self) -> None:
+        name, said = QInputDialog.getText(self, "Save the framing",
+                                          "Call it:", text="")
+        if not said or not name.strip():
+            return
+        if presets.remember(name, self._placement()):
+            self._refresh_presets(name.strip())
+            self._note(self.preview_note, f"framing saved as {name.strip()}")
+        else:
+            self._note(self.preview_note, "could not write the preset file", "error")
+
+    def _apply_preset(self, name: str) -> None:
+        found = presets.load().get(name)
+        if found is None:
+            return
+        self._keep_for_undo()
+        self._store_placement(found)
+        self._sync_transform_ui()
+        self._preview_timer.start()
+        self._note(self.preview_note, f"framing {name} applied")
+
+    def _drop_preset(self) -> None:
+        name = self.preset_box.currentText()
+        if name and presets.forget(name):
+            self._refresh_presets()
+            self._note(self.preview_note, f"{name} forgotten")
+
+    def _refresh_presets(self, pick: str = "") -> None:
+        self.preset_box.blockSignals(True)
+        self.preset_box.clear()
+        self.preset_box.addItems(sorted(presets.load()))
+        if pick:
+            self.preset_box.setCurrentText(pick)
+        self.preset_box.blockSignals(False)
+        empty = self.preset_box.count() == 0
+        self.preset_box.setEnabled(not empty)
+
+    def _table_menu(self, spot) -> None:
+        """The same actions, where the selection is."""
+        menu = QMenu(self)
+        spread = menu.addAction("Apply this framing to the selected sources")
+        spread.setEnabled(len(self._selected_sources()) > 1)
+        spread.triggered.connect(self._apply_to_selected)
+        menu.addSeparator()
+        menu.addAction("Save this framing as ...").triggered.connect(self._save_preset)
+        saved = presets.load()
+        if saved:
+            using = menu.addMenu("Apply a saved framing")
+            for name in sorted(saved):
+                using.addAction(name).triggered.connect(
+                    lambda _=False, n=name: self._apply_preset(n))
+        menu.exec(self.seq_table.viewport().mapToGlobal(spot))
+
+    def _keep_for_undo(self) -> None:
+        """Put the framing as it stands onto this source's history."""
+        self._history.remember(self._source_key(), self._before_edit)
+
+    def _undo(self, forward: bool = False) -> None:
+        key = self._source_key()
+        now = self._placement()
+        back = (self._history.redo(key, now) if forward
+                else self._history.undo(key, now))
+        if back is None:
+            self._note(self.preview_note,
+                       "nothing to redo" if forward else "nothing to undo")
+            return
+        self._before_edit = back.copy()
+        self._store_placement(back)
+        self._sync_transform_ui(remember=False)
+        self._preview_timer.start()
+        behind, ahead = self._history.depth(key)
+        self._note(self.preview_note,
+                   f"{'redone' if forward else 'undone'}   |   {behind} back, "
+                   f"{ahead} forward")
+
+    # -- playing --------------------------------------------------------------
+
+    def _cache_identity(self) -> str:
+        """What the cached frames are of. Anything else in it makes them stale."""
+        if self.current is None:
+            return ""
+        return (f"{self._source_key()}|{self._source_alpha()}"
+                f"|{self.start_spin.value()}-{self.end_spin.value()}")
+
+    def _wants_alpha_frames(self) -> bool:
+        return (remap_render.alpha_setting(self._source_alpha())
+                != remap_engine.ALPHA_IGNORE)
+
+    def _toggle_play(self) -> None:
+        if self._playing:
+            self._stop_play("stopped")
+            return
+        if self.current is None or self._render_running():
+            return
+        if self._cache.span() is None:
+            # Nothing held at all: rather than a dead button, start the same
+            # warming the cache button starts. Once there is something warm,
+            # Play plays and leaves the filling alone -- pressing it used to
+            # push the warm run further out every time, which is half of why
+            # the second press never began where the first one had.
+            self._warm_the_range()
+        warm = self._cache.span()
+        if warm is None:
+            self._note(self.preview_note, "nothing held yet -- warming", "warn")
+            return
+        # Where Play begins is where the playhead is, and nowhere else. It
+        # used to begin at the start of the warm run whatever the playhead
+        # said, so warming from the middle of a clip and pressing Play again
+        # threw the picture back to wherever the warming had started.
+        self._play_from = max(warm[0], min(self.timeline.value(), warm[1]))
+        self._playing = True
+        rate = max(1.0, float(self._output_fps()))
+        # A tick behind zero, so the first tick lands on that frame rather
+        # than one past it.
+        self._play_at = -1.0 / rate
+        icons.put(self.play_button, "pause", 16)
+        self._play_timer.start(max(4, int(1000.0 / rate)))
+
+    def _stop_play(self, why: str = "") -> None:
+        self._play_timer.stop()
+        self._playing = False
+        icons.put(self.play_button, "play", 16)
+        if why:
+            self._note(self.preview_note, why)
+
+    def _warming(self) -> bool:
+        return self._warm_job is not None and self._warm_job.isRunning()
+
+    def _toggle_warm(self) -> None:
+        """The cache button: start filling from here, or stop filling."""
+        if self._warming():
+            self._warm_job.cancel()
+            self._note(self.preview_note, "warming stopped")
+            return
+        self._warm_the_range()
+
+    def _warm_the_range(self) -> None:
+        """Hold the range in memory, from its first frame straight through.
+
+        One reader, one pass, in the order the frames are stored. Filling
+        outwards from the playhead instead put the useful frames first and
+        took longer to finish, because every change of direction is another
+        open and another seek -- and warming is something you set going and
+        leave, so how soon it is all there beats what order it arrives in.
+
+        Picks up where an earlier run left off rather than reading again what
+        is already held.
+        """
+        if self.current is None or self._warming():
+            self.cache_button.setChecked(self._warming())
+            return
+        identity = self._cache_identity()
+        if not identity:
+            self.cache_button.setChecked(False)
+            return
+        first, last = self.start_spin.value(), self.end_spin.value()
+        if not self._cache.matches(identity):
+            self._cache.begin(identity)
+        held = self._cache.span()
+        from_here = first if held is None else max(first, held[1] + 1)
+        if from_here > last:
+            self.cache_button.setChecked(False)
+            self._note(self.preview_note,
+                       f"the whole range is held: {held[0]} to {held[1]}")
+            return
+
+        self._warm_job = app_jobs.WarmJob(
+            self.current, self._cache, from_here, last,
+            self._wants_alpha_frames())
+        self._warm_job.warmed.connect(self._on_warmed)
+        self._warm_job.finished_warming.connect(self._on_warm_done)
+        self.cache_button.setChecked(True)
+        self._note(self.preview_note, f"holding frames from {from_here} on")
+        self._warm_job.start()
+
+    def _on_warmed(self, count: int, spent: int) -> None:
+        self.timeline.set_warm(self._cache.span())
+        self.warm_label.setText(f"{count} frames warm   {spent / 1e9:.1f} GB")
+
+    def _on_warm_done(self, why: str) -> None:
+        self.timeline.set_warm(self._cache.span())
+        self.cache_button.setChecked(False)
+        if why == "memory":
+            self._note(self.preview_note,
+                       f"memory full at {self._cache.count} frames", "warn")
+        elif why and why not in ("done", "stopped", "full"):
+            self._note(self.preview_note, f"could not warm: {why}", "error")
+
+    def _play_tick(self) -> None:
+        """One frame on, chosen by time the way a render chooses it."""
+        warm = self._cache.span()
+        if warm is None:
+            return                          # nothing to show yet; wait for it
+        first, last = warm
+        first = max(first, self.start_spin.value())
+        began = max(first, min(getattr(self, "_play_from", first), last))
+        out_rate = max(1.0, float(self._output_fps()))
+        in_rate = max(1.0, float(self._input_fps()))
+        self._play_at += 1.0 / out_rate
+        frame = began + int(round(self._play_at * in_rate))
+        if frame > last:
+            if not self.loop_button.isChecked():
+                self._stop_play()
+                return
+            # Round again from the start of what is warm, not from where this
+            # pass happened to begin -- a loop that keeps its own late start
+            # plays a shorter and shorter piece each time round.
+            self._play_from = first
+            self._play_at = 0.0
+            frame = first
+        if not self._show_cached(frame):
+            self._stop_play(f"frame {frame} is not held")
+
+    def _show_cached(self, frame: int) -> bool:
+        """Warp one frame straight out of memory and put it on screen.
+
+        False when there is nothing held for that frame, which is the caller's
+        cue to go and read it off the disk.
+        """
+        if self.current is None or not self._cache.matches(self._cache_identity()):
+            return False
+        held = self._cache.get(frame)
+        if held is None:
+            return False
+        try:
+            engine = self.preview.engine(self._preview_resolution(),
+                                         (self.current.width, self.current.height))
+            engine.set_premultiplied(True)
+            if hasattr(engine, "set_source_alpha"):
+                engine.set_source_alpha(
+                    remap_render.alpha_setting(self._source_alpha()))
+            if hasattr(engine, "set_transform"):
+                engine.set_transform(self._placement())
+            if hasattr(engine, "set_output_yuv"):
+                engine.set_output_yuv(False)
+            self._dress(engine, frame)
+            if held.pixels is not None or engine.name != "GPU":
+                image = engine.render(held.pixels)
+            else:
+                image = engine.render(app_jobs.planes_of(held))
+        except Exception as error:  # noqa: BLE001 -- shown in the window
+            self._stop_play(f"playback stopped: {error}")
+            return False
+        self.timeline.blockSignals(True)
+        self.timeline.set_value(frame)
+        self.timeline.blockSignals(False)
+        self._say_frame(frame)
+        self._show_array(image)
+        self._say_time(frame)
+        return True
+
+    def _say_time(self, frame: int) -> None:
+        first, last = self.start_spin.value(), self.end_spin.value()
+        rate = max(1.0, float(self._input_fps()))
+        self.time_label.setText(f"{(frame - first) / rate:6.2f} / "
+                                f"{max(0, last - first + 1) / rate:.2f} s")
+
+    def _forget_cache(self) -> None:
+        """Whatever was held is of something else now."""
+        if self._warm_job is not None and self._warm_job.isRunning():
+            self._warm_job.cancel()
+            self._warm_job.wait(2000)
+        self._stop_play()
+        self._cache.clear()
+        self.timeline.set_warm(None)
+        self.warm_label.setText("")
+        if getattr(self, "cache_button", None) is not None:
+            self.cache_button.setChecked(False)
+
+    def _aiming(self) -> bool:
+        """Whether the handles belong on screen: the Transform tab is on top."""
+        return bool(getattr(self, "tabs", None)) and self.tabs.currentIndex() == 1
+
+    def _on_tab_changed(self, _index: int) -> None:
+        self._sync_transform_ui()
+
+    def _window_map(self):
+        """Which point of the window each pixel of this view came from.
+
+        One per table, kept: building it is twenty milliseconds and the table
+        does not change while someone is dragging a corner.
+        """
+        if self.mode_button.isChecked():
+            return None                       # no handles on the 3D view
+        viewer = self._viewing_from_camera()
+        key = f"{self._resolution_name()}{'-viewer' if viewer else ''}"
+        found = self._maps.get(key)
+        if found is None:
+            try:
+                table = self.preview.table(self._resolution_name())
+                seen = None
+                if viewer:
+                    path = constants.viewer_table_path()
+                    if path is None:
+                        return None
+                    seen = remap_engine.Table(path)
+                found = gizmo.WindowMap(table, seen)
+            except Exception:  # noqa: BLE001 -- no handles is better than no window
+                return None
+            self._maps[key] = found
+        return found
+
+    def _sync_transform_ui(self, remember: bool = True) -> None:
+        """Show the current placement in both halves of the editor."""
+        placement = self._placement()
+        if remember:
+            self._before_edit = placement.copy()
+        self.panel.show_placement(placement, self._source_shape())
+        self.view.show_gizmo(placement, self._window_map(),
+                             self._aiming())
+
+    def _on_transform_edited(self) -> None:
+        """A number changed: keep it, redraw the handles, render again."""
+        self._keep_for_undo()
+        placement = self.panel.placement
+        self._before_edit = placement.copy()
+        self._store_placement(placement)
+        self.view.show_gizmo(placement, self._window_map(),
+                             self._aiming())
+        self._preview_timer.start()
+
+    def _on_gizmo(self) -> None:
+        """A handle was dragged: the numbers follow it, not the other way."""
+        placement = self.view.gizmo.placement
+        self._store_placement(placement)
+        self.panel.show_placement(placement, self._source_shape())
+        self._preview_timer.start()
+
+    def _fit_transform(self, cover: bool) -> None:
+        width, height = self._source_shape()
+        if width <= 0 or height <= 0:
+            self._note(self.preview_note, "nothing loaded to fit", "warn")
+            return
+        self._keep_for_undo()
+        self._store_placement(self._placement().fitted(width, height, cover))
+        self._sync_transform_ui()
+        self._preview_timer.start()
+
+    def _reset_transform(self) -> None:
+        self._keep_for_undo()
+        edge = self._placement().edge
+        fresh = xf.Transform()
+        fresh.edge = edge
+        self._store_placement(fresh)
+        self._sync_transform_ui()
+        self._preview_timer.start()
+
+    def _preview_resolution(self) -> str:
+        """What to warp at right now, which is not always what to render at.
+
+        While a handle is being dragged the picture is being looked at, not
+        read: a quarter-size warp is four times less work and lands inside a
+        frame of the mouse, and the full one arrives the moment it is let go.
+        """
+        if self.view.gizmo.holding():
+            return constants.RESOLUTION_PRESETS[-1][0]
+        return self._resolution_name()
 
     def _resolution_name(self) -> str:
         percent = self.resolution_group.checkedId()
@@ -2206,7 +3518,8 @@ class MainWindow(QMainWindow):
             overlay=self._overlay_array if opacity > 0.0 else None,
             overlay_opacity=opacity,
             source_fps=self._input_fps(),
-            alpha_mode=self._source_alpha())
+            alpha_mode=self._source_alpha(),
+            placement=self._placement())
         self.job.progress.connect(self._on_job_progress)
         self.job.failed.connect(self._on_job_failed)
         self.job.finished_ok.connect(self._on_job_finished)
@@ -2291,6 +3604,12 @@ class MainWindow(QMainWindow):
     dragMoveEvent = dragEnterEvent
 
     def dropEvent(self, event) -> None:  # noqa: N802
+        """The window catches only what missed everything else.
+
+        The viewport and the Frame row each take their own drops, so a file
+        aimed at one of them never arrives here. What lands on the rest of the
+        window is a source: a folder to scan or a movie to pick.
+        """
         paths = [
             Path(url.toLocalFile())
             for url in event.mimeData().urls()
@@ -2351,6 +3670,51 @@ class MainWindow(QMainWindow):
         logfile.write(message)
 
 
+# The theme, in one place and in two forms. The stylesheet is what most of
+# the window is painted with; the palette is what everything that asks Qt
+# rather than reading a rule gets told -- native tab bars, menus, and this
+# application's own icons, which tint themselves to the text colour.
+#
+# Having only the stylesheet was the bug: on a machine set to a light theme
+# the palette stayed light, so icons came out dark on a dark window and the
+# tab bar drew dark text on its dark background.
+INK = "#dcdcdc"
+PAPER = "#232323"
+WELL = "#1b1b1b"
+RAISED = "#333333"
+EDGE = "#454545"
+PICKED = "#3d6d91"
+QUIET = "#6a6a6a"
+
+
+def dark_palette():
+    """The same colours the stylesheet uses, as a palette."""
+    palette = QPalette()
+    pairs = ((QPalette.ColorRole.Window, PAPER),
+             (QPalette.ColorRole.WindowText, INK),
+             (QPalette.ColorRole.Base, WELL),
+             (QPalette.ColorRole.AlternateBase, PAPER),
+             (QPalette.ColorRole.Text, INK),
+             (QPalette.ColorRole.Button, RAISED),
+             (QPalette.ColorRole.ButtonText, INK),
+             (QPalette.ColorRole.ToolTipBase, RAISED),
+             (QPalette.ColorRole.ToolTipText, INK),
+             (QPalette.ColorRole.Highlight, PICKED),
+             (QPalette.ColorRole.HighlightedText, "#ffffff"),
+             (QPalette.ColorRole.PlaceholderText, QUIET),
+             (QPalette.ColorRole.Link, "#7fa7cc"))
+    for group in (QPalette.ColorGroup.Active, QPalette.ColorGroup.Inactive):
+        for role, colour in pairs:
+            palette.setColor(group, role, QColor(colour))
+    for role, colour in ((QPalette.ColorRole.WindowText, QUIET),
+                         (QPalette.ColorRole.Text, QUIET),
+                         (QPalette.ColorRole.ButtonText, QUIET),
+                         (QPalette.ColorRole.Base, PAPER),
+                         (QPalette.ColorRole.Button, "#2a2a2a")):
+        palette.setColor(QPalette.ColorGroup.Disabled, role, QColor(colour))
+    return palette
+
+
 STYLESHEET = """
 QWidget { background:#232323; color:#dcdcdc; font-size:12px; }
 QLineEdit, QSpinBox, QComboBox, QPlainTextEdit, QTableWidget {
@@ -2368,6 +3732,32 @@ QProgressBar::chunk { background:#4a7ea8; }
 QHeaderView::section { background:#2c2c2c; border:0; padding:4px; }
 QTableWidget::item:selected { background:#3d6d91; }
 QStatusBar { color:#d9a441; }
+QTabWidget::pane { border:1px solid #3a3a3a; border-radius:3px; top:-1px; }
+QTabBar::tab { background:#2a2a2a; color:#9a9a9a; border:1px solid #3a3a3a;
+               border-bottom:0; border-top-left-radius:3px;
+               border-top-right-radius:3px; padding:6px 14px; margin-right:2px; }
+QTabBar::tab:hover { background:#333; color:#c8c8c8; }
+QTabBar::tab:selected { background:#232323; color:#dcdcdc;
+                        border-color:#4a4a4a; }
+QToolTip { background:#333; color:#dcdcdc; border:1px solid #4a4a4a;
+           padding:4px; }
+QMenu { background:#282828; border:1px solid #3a3a3a; }
+QMenu::item { padding:5px 22px; }
+QMenu::item:selected { background:#3d6d91; }
+QMenu::item:disabled { color:#666; }
+QMenu::separator { height:1px; background:#3a3a3a; margin:4px 8px; }
+QScrollBar:vertical { background:#1e1e1e; width:12px; margin:0; }
+QScrollBar:horizontal { background:#1e1e1e; height:12px; margin:0; }
+QScrollBar::handle { background:#3f3f3f; border-radius:5px; min-height:24px;
+                     min-width:24px; }
+QScrollBar::handle:hover { background:#4c4c4c; }
+QScrollBar::add-line, QScrollBar::sub-line { height:0; width:0; }
+QScrollBar::add-page, QScrollBar::sub-page { background:transparent; }
+QSlider::groove:horizontal { background:#1b1b1b; height:4px; border-radius:2px; }
+QSlider::handle:horizontal { background:#7fa7cc; width:11px; margin:-5px 0;
+                             border-radius:5px; }
+QSplitter::handle { background:#2c2c2c; }
+QScrollArea { border:0; }
 """
 
 
@@ -2377,6 +3767,11 @@ def main() -> int:
     written = logfile.start()
 
     app = QApplication(sys.argv)
+    # Fusion draws every widget itself, so the palette below is obeyed the same
+    # way on every machine. The native styles paint some of their furniture --
+    # tab bars most visibly -- from the system theme whatever the palette says.
+    app.setStyle("Fusion")
+    app.setPalette(dark_palette())
     app.setStyleSheet(STYLESHEET)
 
     # Unpack whatever the folder is missing before the window reads any of it.

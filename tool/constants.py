@@ -218,12 +218,30 @@ def load_settings() -> dict:
 
 
 def save_settings(values: dict) -> None:
+    """Write the settings, keeping the last two versions beside them.
+
+    This file holds every framing anyone has aimed, keyed by file name, and
+    those took real time to make. Two rolling copies cost nothing -- the whole
+    file is a few kilobytes -- and they are the difference between a bad write
+    being an annoyance and being an afternoon.
+    """
     import json
+    import shutil
+
+    live = PROJECT_DIR / SETTINGS_FILE
+    try:
+        if live.is_file():
+            older = live.with_suffix(live.suffix + ".bak2")
+            newer = live.with_suffix(live.suffix + ".bak")
+            if newer.is_file():
+                shutil.copy2(newer, older)
+            shutil.copy2(live, newer)
+    except OSError:
+        pass                        # a missing backup must not stop a save
 
     try:
-        (PROJECT_DIR / SETTINGS_FILE).write_text(
-            json.dumps(values, ensure_ascii=False, indent=1), encoding="utf-8"
-        )
+        live.write_text(json.dumps(values, ensure_ascii=False, indent=1),
+                        encoding="utf-8")
     except OSError:
         pass
 

@@ -187,6 +187,7 @@ class Output:
     height: int = 0
     png_depth: int = 8
     prores_profile: str = "3"   # 3 = 422 HQ, 4 = 4444
+    first_frame: int = 1        # what the first file of a sequence is called
 
     @property
     def wants_alpha(self) -> bool:
@@ -234,7 +235,11 @@ class Output:
             fmt = "rgba" if self.wants_alpha else "rgb24"
             if self.png_depth == 16:
                 fmt = "rgba64be" if self.wants_alpha else "rgb48be"
-            return ["-c:v", "png", "-pix_fmt", fmt]
+            # Numbered from the frame it came from, not from one. Rendering
+            # frames 100 to 102 wrote files 1 to 3, and putting that back
+            # together with the source was arithmetic done in somebody's head.
+            return ["-c:v", "png", "-pix_fmt", fmt,
+                    "-start_number", str(self.first_frame)]
         if self.kind == "prores":
             profile = "4" if self.wants_alpha else self.prores_profile
             fmt = "yuva444p10le" if self.wants_alpha else "yuv422p10le"
@@ -261,6 +266,7 @@ class Source:
     fps: float = 0.0             # how fast the material is meant to run
     file_fps: float = 0.0        # what the container itself claimed, if anything
     alpha_mode: str = "auto"     # auto | premultiplied | straight | ignore
+    placement: object = None     # a transform.Transform, or None for identity
 
     def seconds(self, frames: int) -> float:
         """How long that many source frames last."""
@@ -443,6 +449,11 @@ def render(source: Source, table_path: Path, output: Output,
         alpha_mode = read_alpha_convention(source, start)
     if hasattr(engine, "set_source_alpha"):
         engine.set_source_alpha(alpha_setting(alpha_mode))
+    # Where the clip sits inside the window the table reads from. Only the
+    # stage that reads the source has any use for it; the second one is
+    # looking at a frame this stage already placed.
+    if hasattr(engine, "set_transform"):
+        engine.set_transform(source.placement)
     # The second stage deliberately does not carry it any further. It is
     # looking at the wall, and a hole in the content is a piece of wall that
     # is not lit -- black, not missing. Its alpha stays the wall's own
@@ -468,6 +479,8 @@ def render(source: Source, table_path: Path, output: Output,
 
     # Two counts, and keeping them apart is the whole of the fix: how many
     # frames the source holds for this range, and how many go in the file.
+    # A sequence on the way out is named after the frame on the way in.
+    output.first_frame = start
     read_count = end - start + 1
     count = frames_out(read_count, source.fps, float(output.fps))
     yuv = getattr(engine, "wants_yuv", False)
@@ -695,6 +708,7 @@ def render(source: Source, table_path: Path, output: Output,
         "output": output.path,
         "encoder": output.chosen_encoder,
         "source_alpha": alpha_mode,
+        "placement": source.placement,
         "command": " ".join(decode_command),
         "complaints": "   ".join(x for x in (said("decoder"), said("encoder")) if x),
     }
