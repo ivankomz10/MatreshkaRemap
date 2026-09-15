@@ -641,3 +641,84 @@ def play_is_never_a_dead_button():
     world.pump()
     want(warming, "Play on an empty cache did nothing at all")
     return "an empty cache and Play starts the same job the button does"
+
+
+# -- single images and the format filter ----------------------------------
+
+def _write_png(path: Path, colour=(120, 180, 240, 255), size=(320, 240)) -> None:
+    from PySide6.QtGui import QImage
+    width, height = size
+    pixels = np.zeros((height, width, 4), dtype=np.uint8)
+    pixels[...] = colour
+    picture = QImage(bytes(pixels.tobytes()), width, height, width * 4,
+                     QImage.Format.Format_RGBA8888)
+    picture.save(str(path))
+
+
+def _mixed_folder() -> Path:
+    """A run, and two lone stills of two formats, sitting in one folder -- the
+    thing a real render output folder is full of."""
+    folder = world.scratch() / "mixed"
+    folder.mkdir(parents=True, exist_ok=True)
+    for old in folder.glob("*"):
+        old.unlink()
+    _write_png(folder / "run_0001.png", (200, 60, 60, 255))
+    _write_png(folder / "run_0002.png", (60, 200, 60, 255))
+    _write_png(folder / "poster.png", (60, 60, 200, 255))
+    _write_png(folder / "logo.bmp", (200, 200, 60, 255))
+    return folder
+
+
+def _open_the_mixed_folder():
+    made = world.window()
+    made.source_edit.setText(constants.display(_mixed_folder()))
+    made.format_filter.setCurrentIndex(0)      # start from All formats
+    made._rescan()
+    world.pump()
+    return made
+
+
+@check(GROUP, "single images show up in the list, not only runs")
+def stills_are_listed():
+    """A folder of one-off frames used to read as empty: a lone file was not a
+    sequence, so the table ignored it and the still could only be dragged on.
+    """
+    made = _open_the_mixed_folder()
+    names = [made.seq_table.item(row, 0).text()
+             for row in range(made.seq_table.rowCount())]
+    want("poster.png" in names, f"the still is not in the list: {names}")
+    want("logo.bmp" in names, f"the .bmp still is not in the list: {names}")
+    want(any(name.startswith("run") for name in names),
+         f"the run went missing when the stills came in: {names}")
+
+    row = names.index("poster.png")
+    made.seq_table.clearSelection()
+    made.seq_table.selectRow(row)
+    world.pump()
+    want(made.current is not None and made.current.kind == "still",
+         "picking a lone image did not load it as a still")
+    want(made.current.count == 1,
+         f"the still says it has {made.current.count} frames")
+    return f"{len(names)} sources listed, stills and a run among them"
+
+
+@check(GROUP, "the format filter narrows the list to one format")
+def the_format_filter_narrows():
+    made = _open_the_mixed_folder()
+    everything = made.seq_table.rowCount()
+    want(everything >= 3, f"only {everything} sources before filtering")
+
+    index = made.format_filter.findData(".bmp")
+    want(index > 0, "the .bmp format never reached the filter menu")
+    made.format_filter.setCurrentIndex(index)
+    world.pump()
+    shown = [made.seq_table.item(row, 0).text()
+             for row in range(made.seq_table.rowCount())]
+    want(shown == ["logo.bmp"],
+         f"the .bmp filter left {shown}, not just the one .bmp still")
+
+    made.format_filter.setCurrentIndex(0)      # back to All formats
+    world.pump()
+    want(made.seq_table.rowCount() == everything,
+         "clearing the filter did not bring the other sources back")
+    return f"{everything} sources, one .bmp, filtered down to it and back"
