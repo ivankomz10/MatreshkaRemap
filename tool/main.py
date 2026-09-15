@@ -1032,8 +1032,12 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"{constants.APP_NAME}  -  {constants.APP_VERSION}")
         self.resize(1320, 880)
 
-        self.sequences: list[scan.Sequence] = []
-        self.current: scan.Sequence | None = None
+        self.sequences: list = []
+        # What the table is actually showing: self.sequences after the format
+        # filter. Row indices in the table are indices into this, not into the
+        # full scan, so a filtered list still selects the right source.
+        self._shown: list = []
+        self.current = None
         # What Auto made of this source's alpha. None until asked, because
         # asking costs a decode; cleared whenever the source changes.
         self._detected_alpha: str | None = None
@@ -1233,6 +1237,22 @@ class MainWindow(QMainWindow):
         rescan.clicked.connect(self._rescan)
         row.addWidget(rescan)
         layout.addLayout(row)
+
+        # Filter the list by format without reading the folder again -- a run
+        # of PNGs, a stray mov and a single still can share a folder, and the
+        # one being worked on should not have to be hunted for.
+        filter_row = QHBoxLayout()
+        filter_row.setSpacing(6)
+        filter_label = QLabel("Show")
+        filter_label.setStyleSheet("color:#9a9a9a;")
+        filter_row.addWidget(filter_label)
+        self.format_filter = QComboBox()
+        self.format_filter.setToolTip("List only sources of this format")
+        self.format_filter.addItem("All formats", None)
+        self.format_filter.currentIndexChanged.connect(self._apply_format_filter)
+        filter_row.addWidget(self.format_filter)
+        filter_row.addStretch(1)
+        layout.addLayout(filter_row)
 
         self.seq_table = QTableWidget(0, 4)
         self.seq_table.setHorizontalHeaderLabels(["Sequence", "Frames", "Range", "Size"])
@@ -1663,6 +1683,27 @@ class MainWindow(QMainWindow):
             widget.setVisible(False)
 
         bar.addSpacing(10)
+        # Keep the window over whatever the content is being cut in, and shrink
+        # it to just the picture -- the two ways to watch a remap while working
+        # in another application at the same time.
+        self.ontop_button = QPushButton(" Top")
+        self.ontop_button.setCheckable(True)
+        self.ontop_button.setFixedWidth(48)
+        self.ontop_button.setStyleSheet(transform_ui.LIT)
+        self.ontop_button.setToolTip("Keep the window above every other")
+        self.ontop_button.toggled.connect(self._on_always_on_top)
+        bar.addWidget(self.ontop_button)
+
+        self.mini_button = QPushButton(" Mini")
+        self.mini_button.setCheckable(True)
+        self.mini_button.setFixedWidth(52)
+        self.mini_button.setStyleSheet(transform_ui.LIT)
+        self.mini_button.setToolTip(
+            "Shrink to just the preview, for a corner of the screen   "
+            "(Esc to come back)")
+        self.mini_button.toggled.connect(self._on_mini)
+        bar.addWidget(self.mini_button)
+
         self.full_button = QPushButton()
         self.full_button.setCheckable(True)
         self.full_button.setFixedWidth(30)
@@ -1679,7 +1720,11 @@ class MainWindow(QMainWindow):
         icons.put(self.snapshot_button, "snapshot", 18)
         self.snapshot_button.clicked.connect(self._save_snapshot)
         bar.addWidget(self.snapshot_button)
-        layout.addLayout(bar)
+        # Held as one widget so Mini can take the whole strip away and put it
+        # back, the same way fullscreen takes the column and the bars.
+        self.preview_toolbar = QWidget()
+        self.preview_toolbar.setLayout(bar)
+        layout.addWidget(self.preview_toolbar)
 
         self.view = ImageView()
         self.view.modes.setVisible(False)      # the bar asks this now
@@ -1699,10 +1744,17 @@ class MainWindow(QMainWindow):
         # it does not refit the view and throw away a close look.
         layout.addWidget(self.view_stack, 1)
 
+        # The timeline, transport and the two notes under them, held as one
+        # widget so Mini can hide the lot and leave only the picture.
+        self.preview_footer = QWidget()
+        footer = QVBoxLayout(self.preview_footer)
+        footer.setContentsMargins(0, 0, 0, 0)
+        footer.setSpacing(6)
+
         self.timeline = Timeline()
         self.timeline.frameChanged.connect(self._on_scrub)
-        layout.addWidget(self.timeline)
-        layout.addLayout(self._build_transport())
+        footer.addWidget(self.timeline)
+        footer.addLayout(self._build_transport())
 
         under = QHBoxLayout()
         self.frame_label = QLabel("")
@@ -1714,7 +1766,8 @@ class MainWindow(QMainWindow):
         self.preview_note.setAlignment(Qt.AlignmentFlag.AlignRight
                                        | Qt.AlignmentFlag.AlignVCenter)
         under.addWidget(self.preview_note, 1)
-        layout.addLayout(under)
+        footer.addLayout(under)
+        layout.addWidget(self.preview_footer)
 
         # The 3D toggle the rest of the window still asks about. Kept as the
         # place that answer lives, driven by the buttons above.
@@ -1850,6 +1903,10 @@ class MainWindow(QMainWindow):
         """
         board = self.centralWidget().layout()
         if going:
+            # Fullscreen and Mini are two answers to the same question and both
+            # own the same bars; only one of them can hold them at a time.
+            if self.mini_button.isChecked():
+                self.mini_button.setChecked(False)
             self._was_showing = [(widget, widget.isVisible())
                                  for widget in (self.tabs, self.render_bar,
                                                 self.log_panel)]
@@ -1864,6 +1921,64 @@ class MainWindow(QMainWindow):
                 self.restoreGeometry(self._before_full)
             for widget, was in getattr(self, "_was_showing", []):
                 widget.setVisible(was)
+
+    # A small window is one wide picture and little else; the wall is close to
+    # three to one, so this is about that shape with room to breathe.
+    _MINI_SIZE = QSize(600, 260)
+    _UNBOUNDED = 16777215          # Qt's QWIDGETSIZE_MAX, the "no cap" value
+
+    def _on_always_on_top(self, on: bool) -> None:
+        """Keep the window over the others, so the preview can sit above the
+        application the content is being cut in."""
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, on)
+        # Toggling a window flag detaches the native window; without showing it
+        # again it simply disappears. The size and place are kept as they were.
+        self.show()
+
+    def _on_mini(self, going: bool) -> None:
+        """Just the picture, in a window small enough to leave in a corner.
+
+        The opposite errand to fullscreen, on the same machinery: what was
+        showing is remembered and put back rather than worked out again, so a
+        bar this mode -- or fullscreen -- deliberately keeps down is not raised
+        on the way out.
+        """
+        hideable = (self.tabs, self.render_bar, self.log_panel,
+                    self.preview_toolbar, self.preview_footer)
+        if going:
+            if self.full_button.isChecked():
+                self.full_button.setChecked(False)
+            self._mini_was_showing = [(widget, widget.isVisible())
+                                      for widget in hideable]
+            self._before_mini = self.saveGeometry()
+            for widget, _ in self._mini_was_showing:
+                widget.setVisible(False)
+            # Leaving a maximized window, the manager restores its old geometry,
+            # and a plain resize in the same breath races that and loses. A cap
+            # it cannot exceed is honoured whatever it was about to restore to;
+            # the cap is lifted once the small size has taken, so the window is
+            # still free to be resized by hand afterwards.
+            self.setMaximumSize(self._MINI_SIZE)
+            self.showNormal()
+            self.resize(self._MINI_SIZE)
+            QTimer.singleShot(120, self._settle_mini)
+        else:
+            self.setMaximumSize(self._UNBOUNDED, self._UNBOUNDED)
+            for widget, was in getattr(self, "_mini_was_showing", []):
+                widget.setVisible(was)
+            if getattr(self, "_before_mini", None) is not None:
+                self.restoreGeometry(self._before_mini)
+
+    def _settle_mini(self) -> None:
+        """Tuck the small window into a corner and let it be resized again."""
+        if not self.mini_button.isChecked():
+            return
+        screen = self.screen().availableGeometry() if self.screen() else None
+        if screen is not None:
+            self.move(screen.right() - self.width() - 24, screen.top() + 48)
+        # Placed and small now; drop the cap so the corner window can grow if
+        # the operator wants a closer look.
+        self.setMaximumSize(self._UNBOUNDED, self._UNBOUNDED)
 
     def showEvent(self, event) -> None:  # noqa: N802 -- Qt naming
         """Repaint the icons once the window is really on screen.
@@ -1914,6 +2029,9 @@ class MainWindow(QMainWindow):
             return
         if event.key() == Qt.Key.Key_Escape and self.full_button.isChecked():
             self.full_button.setChecked(False)
+            return
+        if event.key() == Qt.Key.Key_Escape and self.mini_button.isChecked():
+            self.mini_button.setChecked(False)
             return
         super().keyPressEvent(event)
 
@@ -2124,9 +2242,39 @@ class MainWindow(QMainWindow):
     def _rescan(self) -> None:
         root = constants.resolve(self.source_edit.text())
         self.sequences = scan.scan_folder(root)
+        self._sync_format_filter()
+        self._apply_format_filter()
+        # The filter set a found/shown note already; a missing folder is the
+        # one thing it cannot know about, so it has the last word here.
+        if not root.is_dir():
+            self._note(self.source_note, f"Folder does not exist: {root}", "error")
 
-        self.seq_table.setRowCount(len(self.sequences))
-        for row, sequence in enumerate(self.sequences):
+    def _sync_format_filter(self) -> None:
+        """Offer only the formats the folder actually holds, keeping the choice
+        already made when it survives the rescan."""
+        extensions = sorted({source.extension.lower()
+                             for source in self.sequences if source.extension})
+        chosen = self.format_filter.currentData()
+        self.format_filter.blockSignals(True)
+        self.format_filter.clear()
+        self.format_filter.addItem("All formats", None)
+        for extension in extensions:
+            self.format_filter.addItem(extension.lstrip(".").upper(), extension)
+        index = self.format_filter.findData(chosen)
+        self.format_filter.setCurrentIndex(index if index >= 0 else 0)
+        self.format_filter.blockSignals(False)
+
+    def _apply_format_filter(self) -> None:
+        """Fill the table from the scan, narrowed to the chosen format."""
+        chosen = self.format_filter.currentData()
+        if chosen is None:
+            self._shown = list(self.sequences)
+        else:
+            self._shown = [source for source in self.sequences
+                           if source.extension.lower() == chosen]
+
+        self.seq_table.setRowCount(len(self._shown))
+        for row, sequence in enumerate(self._shown):
             name_item = QTableWidgetItem(f"{sequence.name}{sequence.extension}")
             name_item.setToolTip(
                 f"{constants.display(sequence.directory)}\n{sequence.pattern_label}"
@@ -2137,19 +2285,20 @@ class MainWindow(QMainWindow):
             self.seq_table.setItem(row, 3, QTableWidgetItem(sequence.resolution_label))
 
         self._fit_table()
-        if not root.is_dir():
-            self._note(self.source_note, f"Folder does not exist: {root}", "error")
-        elif not self.sequences:
-            self._note(
-                self.source_note,
-                "No image sequence here. Single files and videos are ignored.",
-                "warn",
-            )
+        if not self.sequences:
+            self._note(self.source_note,
+                       "Nothing to load here -- no images or movies.", "warn")
+        elif not self._shown:
+            self._note(self.source_note,
+                       "No sources of that format in this folder.", "warn")
+        elif len(self._shown) == len(self.sequences):
+            self._note(self.source_note, f"{len(self.sequences)} source(s) found.")
         else:
-            self._note(self.source_note, f"{len(self.sequences)} sequence(s) found.")
+            self._note(self.source_note,
+                       f"{len(self._shown)} of {len(self.sequences)} shown.")
 
         self.current = None
-        if len(self.sequences) == 1:
+        if len(self._shown) == 1:
             self.seq_table.selectRow(0)
         else:
             self._on_sequence_selected()
@@ -2180,10 +2329,10 @@ class MainWindow(QMainWindow):
         # The row the cursor is on, not the first of the selection: dragging a
         # selection upwards would otherwise show the far end of it.
         here = model.currentIndex().row() if model else -1
-        if not (0 <= here < len(self.sequences)) or not any(
+        if not (0 <= here < len(self._shown)) or not any(
                 index.row() == here for index in rows):
             here = rows[0].row() if rows else -1
-        self.current = self.sequences[here] if here >= 0 else None
+        self.current = self._shown[here] if here >= 0 else None
 
         if self.current is None:
             for spin in (self.start_spin, self.end_spin):
@@ -2971,7 +3120,7 @@ class MainWindow(QMainWindow):
         if model is None:
             return []
         rows = sorted(index.row() for index in model.selectedRows())
-        return [self.sequences[row] for row in rows if 0 <= row < len(self.sequences)]
+        return [self._shown[row] for row in rows if 0 <= row < len(self._shown)]
 
     @staticmethod
     def _key_of(item) -> str:
@@ -3640,7 +3789,7 @@ class MainWindow(QMainWindow):
         self._log(f"dropped file is neither an image nor a movie: {path.name}")
 
     def _select_by_path(self, path: Path) -> None:
-        for row, source in enumerate(self.sequences):
+        for row, source in enumerate(self._shown):
             if source.kind == "movie" and source.path == path:
                 self.seq_table.selectRow(row)
                 return
