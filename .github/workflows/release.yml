@@ -1,0 +1,110 @@
+name: Build and release
+
+# Build the Windows executable and the macOS app, and — when a version tag is
+# pushed — publish them as a GitHub release. Push a tag such as `v0.3` to cut a
+# release; run the workflow by hand (workflow_dispatch) to build the binaries
+# without publishing anything.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: Windows executable
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r tool/requirements.txt pyinstaller
+
+      - name: Build MatreshkaRemapRenderer.exe
+        run: pyinstaller --noconfirm --distpath dist --workpath build tool/build.spec
+
+      - name: Stage the executable
+        shell: bash
+        run: |
+          mkdir -p out
+          cp "dist/MatreshkaRemapRenderer.exe" "out/MatreshkaRemapRenderer-windows.exe"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: out/*
+          if-no-files-found: error
+
+  macos:
+    name: macOS app
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Sync sources into mac_build and pack the source archive
+        run: python pack_mac.py
+
+      - name: Build MatreshkaRemapRenderer.app
+        # build_mac.sh makes its own venv inside mac_build, installs the
+        # requirements and PyInstaller, and builds mac_build/dist/*.app. Left
+        # unsigned here (ad-hoc); set the signing/notarization variables it
+        # documents to produce a bundle that travels to other Macs.
+        run: |
+          chmod +x mac_build/build_mac.sh
+          ./mac_build/build_mac.sh
+
+      - name: Zip the app bundle and keep the source archive
+        # ditto preserves the bundle's symlinks and metadata, which a plain zip
+        # mangles into an app that will not launch.
+        run: |
+          mkdir -p out
+          ditto -c -k --keepParent "mac_build/dist/MatreshkaRemapRenderer.app" "out/MatreshkaRemapRenderer-macos.zip"
+          cp "MatreshkaRemapRenderer_mac.zip" "out/MatreshkaRemapRenderer-mac-source.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: out/*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    # Only a pushed tag becomes a release; a manual run just leaves the built
+    # binaries as workflow artifacts to download.
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Show what will be attached
+        run: find artifacts -type f -print
+
+      - name: Create the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/windows/*
+            artifacts/macos/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
