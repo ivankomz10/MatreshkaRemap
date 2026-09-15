@@ -1,15 +1,26 @@
 name: Build and release
 
-# Build the Windows executable and the macOS app, and — when a version tag is
-# pushed — publish them as a GitHub release. Push a tag such as `v0.3` to cut a
-# release; run the workflow by hand (workflow_dispatch) to build the binaries
-# without publishing anything.
+# Build the Windows executable and the macOS app and publish them as a GitHub
+# release.
+#
+# Two ways to cut a release:
+#   * push a version tag, e.g. `git push origin v0.3`; or
+#   * run the workflow by hand and type the version in the "version" box.
+#
+# Reusing a version that already has a release overwrites it: the old release
+# and its tag are removed and recreated on the current commit, so bumping the
+# version makes a new release and not bumping it replaces the last one.
 
 on:
   push:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build and release, e.g. 0.3 (published as tag v0.3). Reusing an existing version overwrites its release."
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -19,6 +30,33 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  meta:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - id: resolve
+        # A tag push carries the version in the ref; a manual run carries it in
+        # the input. Either way it is normalised to a single `v`-prefixed tag.
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            raw="${{ inputs.version }}"
+          else
+            raw="${{ github.ref_name }}"
+          fi
+          raw="$(echo "$raw" | tr -d '[:space:]')"
+          if [ -z "$raw" ]; then
+            echo "No version given." >&2
+            exit 1
+          fi
+          case "$raw" in
+            v*) tag="$raw" ;;
+            *)  tag="v$raw" ;;
+          esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Releasing as $tag"
+
   windows:
     name: Windows executable
     runs-on: windows-latest
@@ -87,11 +125,8 @@ jobs:
 
   release:
     name: Publish release
-    needs: [windows, macos]
+    needs: [meta, windows, macos]
     runs-on: ubuntu-latest
-    # Only a pushed tag becomes a release; a manual run just leaves the built
-    # binaries as workflow artifacts to download.
-    if: startsWith(github.ref, 'refs/tags/')
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -100,9 +135,27 @@ jobs:
       - name: Show what will be attached
         run: find artifacts -type f -print
 
+      - name: Overwrite any existing release for this version
+        # If the version was not bumped, the release and its tag already exist.
+        # Remove them so the tag re-points at this commit and the assets are
+        # replaced cleanly rather than piling up alongside the old ones.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.meta.outputs.tag }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG exists -- deleting it and its tag to overwrite."
+            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+          else
+            echo "No existing release for $TAG."
+          fi
+
       - name: Create the release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.meta.outputs.tag }}
+          name: ${{ needs.meta.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           files: |
             artifacts/windows/*
             artifacts/macos/*
