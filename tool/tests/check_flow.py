@@ -656,8 +656,12 @@ def _write_png(path: Path, colour=(120, 180, 240, 255), size=(320, 240)) -> None
 
 
 def _mixed_folder() -> Path:
-    """A run, and two lone stills of two formats, sitting in one folder -- the
-    thing a real render output folder is full of."""
+    """A run, two lone stills of two formats, and two movies of two containers,
+    sitting in one folder -- the thing a real render output folder is full of.
+
+    The movies are empty files: scanning lists them by extension without
+    opening them, which is all the format filter needs to sort them.
+    """
     folder = world.scratch() / "mixed"
     folder.mkdir(parents=True, exist_ok=True)
     for old in folder.glob("*"):
@@ -666,6 +670,8 @@ def _mixed_folder() -> Path:
     _write_png(folder / "run_0002.png", (60, 200, 60, 255))
     _write_png(folder / "poster.png", (60, 60, 200, 255))
     _write_png(folder / "logo.bmp", (200, 200, 60, 255))
+    (folder / "clip.mp4").write_bytes(b"")
+    (folder / "movie.mov").write_bytes(b"")
     return folder
 
 
@@ -722,3 +728,33 @@ def the_format_filter_narrows():
     want(made.seq_table.rowCount() == everything,
          "clearing the filter did not bring the other sources back")
     return f"{everything} sources, one .bmp, filtered down to it and back"
+
+
+@check(GROUP, "the Video umbrella filters to the movies whatever the container")
+def the_video_filter_gathers_movies():
+    """mp4, mov, mkv and the rest are one family; picking Video should leave
+    every movie and no stills, without naming each container."""
+    made = _open_the_mixed_folder()
+    items = [made.format_filter.itemText(i)
+             for i in range(made.format_filter.count())]
+    want("Video" in items, f"there is no Video umbrella in the filter: {items}")
+    want("Images" in items, f"there is no Images umbrella in the filter: {items}")
+    want("MP4" in items and "MOV" in items,
+         f"the specific movie formats are missing: {items}")
+
+    made.format_filter.setCurrentIndex(made.format_filter.findData("video"))
+    world.pump()
+    shown = sorted(made.seq_table.item(row, 0).text()
+                   for row in range(made.seq_table.rowCount()))
+    want(shown == ["clip.mp4", "movie.mov"],
+         f"the Video filter left {shown}, not just the two movies")
+
+    made.format_filter.setCurrentIndex(made.format_filter.findData("image"))
+    world.pump()
+    kinds = {made._shown[row].kind for row in range(len(made._shown))}
+    want(kinds and "movie" not in kinds,
+         f"the Images filter still shows non-image sources: {kinds}")
+
+    made.format_filter.setCurrentIndex(0)      # back to All formats
+    world.pump()
+    return f"Video → {shown}, Images → {sorted(kinds)}"

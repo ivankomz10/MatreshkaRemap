@@ -2249,15 +2249,32 @@ class MainWindow(QMainWindow):
         if not root.is_dir():
             self._note(self.source_note, f"Folder does not exist: {root}", "error")
 
+    # A source's kind sorts it into one of two families for the filter.
+    _IMAGE_KINDS = ("sequence", "still")
+    _VIDEO_KINDS = ("movie",)
+
     def _sync_format_filter(self) -> None:
-        """Offer only the formats the folder actually holds, keeping the choice
-        already made when it survives the rescan."""
+        """Offer the families the folder holds and the exact formats within
+        them, keeping the choice already made when it survives the rescan.
+
+        Two umbrellas come first -- Images and Video -- so a folder of mixed
+        containers can be narrowed to all the movies (mp4, mov, mkv and the
+        rest) or all the stills at once, without picking each extension apart.
+        """
+        have_images = any(source.kind in self._IMAGE_KINDS
+                          for source in self.sequences)
+        have_video = any(source.kind in self._VIDEO_KINDS
+                         for source in self.sequences)
         extensions = sorted({source.extension.lower()
                              for source in self.sequences if source.extension})
         chosen = self.format_filter.currentData()
         self.format_filter.blockSignals(True)
         self.format_filter.clear()
         self.format_filter.addItem("All formats", None)
+        if have_images:
+            self.format_filter.addItem("Images", "image")
+        if have_video:
+            self.format_filter.addItem("Video", "video")
         for extension in extensions:
             self.format_filter.addItem(extension.lstrip(".").upper(), extension)
         index = self.format_filter.findData(chosen)
@@ -2265,10 +2282,16 @@ class MainWindow(QMainWindow):
         self.format_filter.blockSignals(False)
 
     def _apply_format_filter(self) -> None:
-        """Fill the table from the scan, narrowed to the chosen format."""
+        """Fill the table from the scan, narrowed to the chosen family or format."""
         chosen = self.format_filter.currentData()
         if chosen is None:
             self._shown = list(self.sequences)
+        elif chosen == "image":
+            self._shown = [source for source in self.sequences
+                           if source.kind in self._IMAGE_KINDS]
+        elif chosen == "video":
+            self._shown = [source for source in self.sequences
+                           if source.kind in self._VIDEO_KINDS]
         else:
             self._shown = [source for source in self.sequences
                            if source.extension.lower() == chosen]
