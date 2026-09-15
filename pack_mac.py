@@ -41,6 +41,11 @@ def sync() -> None:
     for name in APP + BAKES:
         shutil.copy2(TOOL / f"{name}.py", MAC / f"{name}.py")
     shutil.copy2(TOOL / "requirements.txt", MAC / "requirements.txt")
+    # The two loose data files build_mac.sh bundles by name. Check.png is not
+    # tracked in mac_build, so without copying it here the archive builds an app
+    # with no overlay -- and PyInstaller stops dead on the missing --add-data.
+    for extra in ("Check.png", "remap_tool.json"):
+        shutil.copy2(TOOL / extra, MAC / extra)
     art = MAC / "icons"
     art.mkdir(exist_ok=True)
     for picture in (TOOL / "icons").glob("*.png"):

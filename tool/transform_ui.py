@@ -366,6 +366,22 @@ class TransformPanel(QFrame):
         self.resets.append((button, keys))
         return button
 
+    def _default_placement(self) -> xf.Transform:
+        """The framing a clip of this shape opens at.
+
+        Identity everywhere but the scale, which is set so the clip sits in the
+        window undistorted -- the same number `main._placement` opens a fresh
+        clip with. On a clip already shaped like the wall's picture this is the
+        bare identity; on anything else the scale's default is the fit, not one.
+
+        Resetting a field, and deciding whether its arrow has anything to undo,
+        both answer to this rather than to a bare `Transform()`: otherwise the
+        scale arrow lights on every clip that is not the wall's own shape and
+        springs the picture back to stretched when pressed.
+        """
+        width, height = self.source_size
+        return xf.Transform().fitted(width, height, False)
+
     def _show_resets(self) -> None:
         """Lit where there is something to undo, and dead where there is not.
 
@@ -373,7 +389,7 @@ class TransformPanel(QFrame):
         does nothing, and a row of them says nothing about which values have
         been touched.
         """
-        fresh = xf.Transform()
+        fresh = self._default_placement()
         for button, keys in self.resets:
             changed = any(getattr(self.placement, key) != getattr(fresh, key)
                           for key in keys)
@@ -389,7 +405,7 @@ class TransformPanel(QFrame):
                   QColor(ACCENT) if locked else icons.ink(self.link))
 
     def _reset_keys(self, keys) -> None:
-        fresh = xf.Transform()
+        fresh = self._default_placement()
         for key in keys:
             setattr(self.placement, key, getattr(fresh, key))
         self.show_placement(self.placement, self.source_size)

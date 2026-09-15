@@ -1,0 +1,4 @@
+{
+  "name": "Matreshka Remap Renderer",
+  "install": "./.cursor/install.sh"
+}

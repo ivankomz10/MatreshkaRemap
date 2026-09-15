@@ -85,6 +85,79 @@ class Sequence:
 
 
 @dataclass
+class Still:
+    """A single image used as the source on its own.
+
+    A folder does not have to hold a numbered run to be worth opening -- one
+    exported frame, a poster, a card someone made in another tool. It presents
+    the same surface as Sequence and Movie, so the window does not care which
+    of the three it holds, and every frame number maps to the one file.
+    """
+
+    kind = "still"
+    padding = 0
+
+    path: Path
+    width: int = 0
+    height: int = 0
+
+    @property
+    def directory(self) -> Path:
+        return self.path.parent
+
+    @property
+    def name(self) -> str:
+        return self.path.stem
+
+    @property
+    def extension(self) -> str:
+        return self.path.suffix.lower()
+
+    @property
+    def first(self) -> int:
+        return 1
+
+    @property
+    def last(self) -> int:
+        return 1
+
+    @property
+    def count(self) -> int:
+        return 1
+
+    @property
+    def count_label(self) -> str:
+        return "1"
+
+    @property
+    def missing(self) -> list[int]:
+        return []
+
+    @property
+    def is_contiguous(self) -> bool:
+        return True
+
+    def path_for(self, number: int) -> Path:
+        return self.path
+
+    @property
+    def source_path(self) -> Path:
+        return self.path
+
+    @property
+    def resolution_label(self) -> str:
+        return f"{self.width}x{self.height}" if self.width and self.height else "-"
+
+    @property
+    def range_label(self) -> str:
+        return "still"
+
+    @property
+    def pattern_label(self) -> str:
+        return self.path.name
+
+
+@dataclass
 class Movie:
     """A single video file used as the source.
 
@@ -184,12 +257,15 @@ def _scan_movies(directory: Path) -> list[Movie]:
     ]
 
 
-def _scan_one_directory(directory: Path) -> list[Sequence]:
+def _scan_one_directory(directory: Path) -> tuple[list[Sequence], list[Still]]:
+    """Numbered runs of two or more become sequences; every other image is a
+    still on its own -- a lone numbered file, or one with no number at all."""
     groups: dict[tuple[str, str, int], list[int]] = {}
+    loners: list[Path] = []
     try:
         entries = list(os.scandir(directory))
     except OSError:
-        return []
+        return [], []
 
     for entry in entries:
         if not entry.is_file():
@@ -200,6 +276,7 @@ def _scan_one_directory(directory: Path) -> list[Sequence]:
             continue
         match = _TRAILING_NUMBER.match(stem)
         if not match:
+            loners.append(Path(entry.path))        # an image with no number
             continue
         prefix, digits = match.group(1), match.group(2)
         groups.setdefault((prefix, extension, len(digits)), []).append(int(digits))
@@ -207,31 +284,44 @@ def _scan_one_directory(directory: Path) -> list[Sequence]:
     sequences = []
     for (prefix, extension, padding), numbers in groups.items():
         if len(numbers) < 2:
-            continue  # a lone file is not a sequence
+            # A lone numbered file is a still, not a one-frame sequence.
+            loners.append(directory / f"{prefix}{numbers[0]:0{padding}d}{extension}")
+            continue
         numbers.sort()
         sequence = Sequence(directory, prefix, extension, padding, numbers)
         sequence.width, sequence.height = probe_size(sequence.path_for(sequence.first))
         sequences.append(sequence)
-    return sequences
+
+    stills = []
+    for path in loners:
+        still = Still(path)
+        still.width, still.height = probe_size(path)
+        stills.append(still)
+    return sequences, stills
 
 
 def scan_folder(root: Path) -> list:
-    """Scan `root` and its immediate subdirectories for sequences and movies."""
+    """Scan `root` and its immediate subdirectories for sequences, movies and
+    single images."""
     if not root.is_dir():
         return []
 
-    found = _scan_one_directory(root) + _scan_movies(root)
+    sequences, stills = _scan_one_directory(root)
+    found = sequences + _scan_movies(root) + stills
     try:
         for entry in os.scandir(root):
             if entry.is_dir():
                 child = Path(entry.path)
-                found.extend(_scan_one_directory(child))
+                child_sequences, child_stills = _scan_one_directory(child)
+                found.extend(child_sequences)
                 found.extend(_scan_movies(child))
+                found.extend(child_stills)
     except OSError:
         pass
 
     # Longest first; movies that have not been probed yet have no count and
-    # sort to the bottom rather than pretending to be empty.
+    # sort to the bottom rather than pretending to be empty. A single image
+    # counts one, so it sits above an unprobed movie and below a real run.
     found.sort(key=lambda source: (-source.count, source.name.lower()))
     return found
 
