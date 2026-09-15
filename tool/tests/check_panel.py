@@ -111,6 +111,41 @@ def resets_light_up():
     return f"{len(panel.resets)} arrows, one lights for one changed value"
 
 
+@check(GROUP, "a reset returns a field to the default for the clip's shape")
+def reset_uses_the_aspect_default():
+    """The fault: the reset arrows measured against a bare identity, so on any
+    clip that is not the wall's own shape the scale arrow was lit from the
+    start and pressing it sprang the picture back to stretched. The default a
+    reset answers to is the fit for this clip's proportions, not a scale of one.
+    """
+    panel = _panel()
+    wide = (1920, 1080)                       # not the wall's shape
+    fitted = xf.Transform().fitted(*wide, False)
+    want(abs(fitted.scale_x - 1.0) > 1e-6 or abs(fitted.scale_y - 1.0) > 1e-6,
+         "the chosen shape happens to fit at one, so this proves nothing")
+
+    panel.show_placement(fitted.copy(), wide)
+    world.pump()
+    lit = {tuple(keys): button.isEnabled() for button, keys in panel.resets}
+    want(not lit.get(("scale_x", "scale_y")),
+         "the scale arrow lit on a clip sitting untouched at its own fit")
+
+    stretched = fitted.copy()
+    stretched.scale_x *= 1.7
+    stretched.scale_y *= 1.7
+    panel.show_placement(stretched, wide)
+    world.pump()
+    lit = {tuple(keys): button.isEnabled() for button, keys in panel.resets}
+    want(lit.get(("scale_x", "scale_y")),
+         "the scale arrow stayed dark after the scale was moved off the fit")
+
+    panel._reset_keys(("scale_x", "scale_y"))
+    close(panel.placement.scale_x, fitted.scale_x, 1e-9, "scale_x back to the fit")
+    close(panel.placement.scale_y, fitted.scale_y, 1e-9, "scale_y back to the fit")
+    return (f"reset lands scale on the fit {fitted.scale_x:.3f} x "
+            f"{fitted.scale_y:.3f}, not on one")
+
+
 @check(GROUP, "the scale link says which way it is set")
 def link_is_legible():
     """Checked and unchecked have to differ by more than a shade -- the icon
