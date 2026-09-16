@@ -802,3 +802,33 @@ def the_resolved_folder_is_writable():
     want(str(constants.PROJECT_DIR) in str(logfile.folder()),
          f"the log would still be written beside the app: {logfile.folder()}")
     return str(constants.PROJECT_DIR)
+
+
+# -- the ffmpeg the app reaches for ---------------------------------------
+
+@check("the bundled ffmpeg", "a copy shipped inside the app is used ahead of the download and PATH")
+def bundled_ffmpeg_wins():
+    """The macOS build carries a HAP-capable ffmpeg inside the bundle. Wherever
+    one is bundled it must be preferred, so the wall's codec is there without a
+    download and without depending on whatever ffmpeg happens to be on PATH."""
+    import sys
+    import depends
+    fake_bundle = world.scratch() / "fake_bundle"
+    fake_bundle.mkdir(parents=True, exist_ok=True)
+    shipped = fake_bundle / depends.BINARY
+    shipped.write_text("#!/bin/sh\n")     # only its presence is under test here
+    was = getattr(sys, "_MEIPASS", None)
+    try:
+        sys._MEIPASS = str(fake_bundle)    # what a frozen bundle sets
+        want(depends.bundled_ffmpeg() == str(shipped),
+             f"the bundled ffmpeg was not found: {depends.bundled_ffmpeg()}")
+        want(depends.ffmpeg_command() == str(shipped),
+             f"ffmpeg_command did not prefer the bundled copy: {depends.ffmpeg_command()}")
+    finally:
+        if was is None:
+            del sys._MEIPASS
+        else:
+            sys._MEIPASS = was
+    want(depends.bundled_ffmpeg() is None,
+         "a bundle was still reported after the frozen marker was cleared")
+    return "a bundled ffmpeg is chosen over the download and PATH"

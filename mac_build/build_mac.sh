@@ -39,6 +39,31 @@ $PYTHON -m venv .venv
 ./.venv/bin/python -m pip install --upgrade pip >/dev/null
 ./.venv/bin/python -m pip install -r requirements.txt pyinstaller
 
+echo "==> fetching a HAP-capable ffmpeg to bundle"
+# The wall's player reads HAP, so the renderer has to be able to write it, and
+# HAP encoding needs an ffmpeg built with libsnappy -- a stock build cannot do
+# it. Martin-Riedl publishes static macOS builds (arm64 and amd64) that include
+# snappy, so the app can carry one and never send anyone hunting for a codec.
+case "$(uname -m)" in
+    arm64)  FF_ARCH="arm64" ;;
+    x86_64) FF_ARCH="amd64" ;;
+    *)      FF_ARCH="arm64" ;;
+esac
+FFMPEG_DIR="$HERE/.ffmpeg_bundle"
+FFMPEG_BIN="$FFMPEG_DIR/ffmpeg"
+rm -rf "$FFMPEG_DIR"
+mkdir -p "$FFMPEG_DIR"
+curl -fL --retry 3 -o "$FFMPEG_DIR/ffmpeg.zip" \
+    "https://ffmpeg.martin-riedl.de/redirect/latest/macos/${FF_ARCH}/snapshot/ffmpeg.zip"
+unzip -o -q "$FFMPEG_DIR/ffmpeg.zip" -d "$FFMPEG_DIR"
+chmod +x "$FFMPEG_BIN"
+# Refuse to ship a build that cannot do the one thing it was fetched for.
+if ! "$FFMPEG_BIN" -hide_banner -encoders 2>/dev/null | grep -qi 'hap'; then
+    echo "the fetched ffmpeg has no HAP encoder -- refusing to bundle it" >&2
+    exit 1
+fi
+echo "    $("$FFMPEG_BIN" -version | head -1)   ($FF_ARCH, HAP ok)"
+
 echo "==> building"
 # On macOS the --add-data separator is ':' -- on Windows it is ';'.
 # Paths must be absolute because --specpath moves where relative ones resolve.
@@ -55,6 +80,7 @@ echo "==> building"
     --add-data "$HERE/tables/screen_geometry.npz:." \
     --add-data "$HERE/tables/viewer_table.npz:." \
     --add-data "$HERE/icons:icons" \
+    --add-binary "$FFMPEG_BIN:." \
     --exclude-module PySide6.QtWebEngineCore \
     --exclude-module PySide6.QtWebEngineWidgets \
     --exclude-module PySide6.QtQuick \
@@ -73,6 +99,14 @@ echo "==> building"
     --workpath build \
     --specpath build \
     main.py
+
+echo "==> checking the bundled ffmpeg survived packaging with HAP intact"
+BUNDLED_FF="$(find "$APP/Contents" -type f -name ffmpeg -perm +111 | head -1)"
+if [ -z "$BUNDLED_FF" ] || ! "$BUNDLED_FF" -hide_banner -encoders 2>/dev/null | grep -qi 'hap'; then
+    echo "the bundled ffmpeg is missing or lost HAP after packaging" >&2
+    exit 1
+fi
+echo "    $BUNDLED_FF   (HAP ok)"
 
 if [ -n "${SIGN_IDENTITY:-}" ]; then
     echo "==> signing with $SIGN_IDENTITY"
