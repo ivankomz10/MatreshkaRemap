@@ -55,7 +55,9 @@ class Requirement:
 
 
 def tools_dir() -> Path:
-    return constants.app_dir() / TOOLS_DIR
+    # In the writable working folder, not beside the executable: on macOS the
+    # app's own location is often read-only, so a download beside it would fail.
+    return constants.PROJECT_DIR / TOOLS_DIR
 
 
 def ffmpeg_command() -> str:
@@ -107,7 +109,7 @@ def check() -> list[Requirement]:
     command = ffmpeg_command()
     version = ffmpeg_version(command)
     if version:
-        where = "beside the application" if command != "ffmpeg" \
+        where = "in the project folder" if command != "ffmpeg" \
             and str(tools_dir()) in command else command
         found.append(Requirement("ffmpeg", True, f"{version[:70]}   [{where}]"))
     else:
