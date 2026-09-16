@@ -11,8 +11,11 @@ build stays inside this folder.
 ## Requirements
 
 - **macOS** with Python **3.10 or newer** (`python3 --version`)
-- Internet access for one `pip install` (PySide6 + PyInstaller, ~150 MB)
-- **ffmpeg** on the PATH — it decodes the source and writes the output
+- Internet access during the build for one `pip install` (PySide6 + PyInstaller,
+  ~150 MB) and for the ffmpeg that gets bundled (below)
+- **No ffmpeg needed on the machine** — the build fetches a static,
+  HAP-capable ffmpeg and bundles it inside the app, so the finished `.app`
+  carries its own codec and nothing is downloaded on first run
 - a GPU with Metal (any Mac from the last decade); without one the app falls
   back to the CPU renderer automatically
 
@@ -41,6 +44,19 @@ If `python3` is not the interpreter you want:
 PYTHON=/opt/homebrew/bin/python3.12 ./build_mac.sh
 ```
 
+## The bundled ffmpeg, and HAP
+
+The screen's own player reads **HAP**, and HAP encoding needs an ffmpeg built
+with libsnappy — a stock ffmpeg cannot write it. So `build_mac.sh` downloads a
+static, HAP-capable build for the machine's architecture (arm64 or Intel) from
+[ffmpeg.martin-riedl.de](https://ffmpeg.martin-riedl.de/) and bundles it inside
+the app; the build stops if that ffmpeg cannot encode HAP, before and after
+packaging, so a build that ships is a build whose codec works.
+
+That ffmpeg is GPL: the binary travels with the app, and its source is the
+provider's above. Nothing links against it — the app runs it as a child
+process — so only the ffmpeg binary itself carries that licence.
+
 ## Running it
 
 Move `MatreshkaRemapRenderer.app` into an **empty folder** and open it. On first
@@ -58,11 +74,12 @@ Two separate mechanisms, worth telling apart.
 **Quarantine and app translocation.** Anything that arrives through a browser,
 AirDrop or a zip gets the `com.apple.quarantine` flag. macOS then launches the
 app from a random **read-only copy** under
-`/private/var/folders/…/AppTranslocation/`. This app finds its project folder
-by looking at where it is, so translocated it would try to create `ToRemap/`
-and `OUT/` inside that temporary copy. It detects this and says so in the
-status bar instead of failing quietly — but it cannot work until the flag is
-gone. Two ways out, both free:
+`/private/var/folders/…/AppTranslocation/`. This app normally finds its project
+folder by looking at where it is, so translocated it would try to create
+`ToRemap/` and `OUT/` inside that temporary copy. It now notices that its own
+location is read-only or translocated and falls back to a stable per-user
+folder — `~/Documents/Matreshka Remap Renderer` — so it works either way; but to
+have the folders sit beside the app where you put it, clear the flag or move it:
 
 ```bash
 xattr -dr com.apple.quarantine /path/to/MatreshkaRemapRenderer.app

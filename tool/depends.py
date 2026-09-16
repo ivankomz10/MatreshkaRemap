@@ -1,13 +1,16 @@
 """What the application needs from the machine, and how to get it.
 
-Everything Python is inside the executable. The one thing that is not is
-ffmpeg: it is the render pipeline's decoder and encoder, it is large, and its
-licence makes shipping a build inside someone else's binary a question better
-left alone. So it is looked for, and offered.
+Everything Python is inside the executable. ffmpeg -- the render pipeline's
+decoder and encoder -- is the one large thing beside it, and how it is found
+depends on the platform:
 
-A downloaded copy lands in a folder beside the application rather than anywhere
-system-wide -- nothing is installed, nothing is put on PATH, and deleting the
-folder undoes it completely.
+- The macOS build ships a static, HAP-capable ffmpeg inside the app bundle, so
+  the wall's own codec works out of the box and nothing is fetched on first
+  run. (HAP needs an ffmpeg built with libsnappy; a stock one cannot encode it.)
+- Windows and a bare source checkout carry none, and offer to download one. A
+  downloaded copy lands in a folder beside the working files rather than
+  anywhere system-wide -- nothing is installed, nothing is put on PATH, and
+  deleting the folder undoes it completely.
 """
 from __future__ import annotations
 
@@ -60,8 +63,23 @@ def tools_dir() -> Path:
     return constants.PROJECT_DIR / TOOLS_DIR
 
 
+def bundled_ffmpeg() -> str | None:
+    """A copy shipped inside the application, if this build carries one.
+
+    The macOS build bundles a HAP-capable static ffmpeg; it is found in the
+    unpacked bundle the same way the tables and Check.png are. Windows and a
+    source checkout carry none and this returns nothing.
+    """
+    found = constants.bundled_path(BINARY)
+    return str(found) if found is not None else None
+
+
 def ffmpeg_command() -> str:
-    """The ffmpeg to use: the downloaded one first, then whatever is on PATH."""
+    """The ffmpeg to use: the one shipped inside the app first, then a
+    downloaded one, then whatever is on PATH."""
+    inside = bundled_ffmpeg()
+    if inside:
+        return inside
     local = tools_dir() / BINARY
     if local.is_file():
         return str(local)
@@ -109,8 +127,12 @@ def check() -> list[Requirement]:
     command = ffmpeg_command()
     version = ffmpeg_version(command)
     if version:
-        where = "in the project folder" if command != "ffmpeg" \
-            and str(tools_dir()) in command else command
+        if command == bundled_ffmpeg():
+            where = "bundled with the app"
+        elif command != "ffmpeg" and str(tools_dir()) in command:
+            where = "in the project folder"
+        else:
+            where = command
         found.append(Requirement("ffmpeg", True, f"{version[:70]}   [{where}]"))
     else:
         found.append(Requirement(
