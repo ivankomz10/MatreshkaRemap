@@ -71,7 +71,10 @@ def path() -> Path | None:
 
 
 def folder() -> Path:
-    return constants.app_dir() / DIR_NAME
+    # Beside the working folders, not beside the executable: on macOS the app's
+    # own location is often read-only (/Applications, or a translocated copy),
+    # and a log that cannot be written is the one thing that must not fail.
+    return constants.PROJECT_DIR / DIR_NAME
 
 
 def write(message: str, tag: str = "") -> None:

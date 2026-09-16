@@ -758,3 +758,47 @@ def the_video_filter_gathers_movies():
     made.format_filter.setCurrentIndex(0)      # back to All formats
     world.pump()
     return f"Video → {shown}, Images → {sorted(kinds)}"
+
+
+# -- where the working folder lands ---------------------------------------
+
+PATHS = "the working folder"
+
+
+@check(PATHS, "a translocated or read-only app writes to a real folder, not a temp copy")
+def translocation_is_stepped_around():
+    """The macOS fault this fixes: a quarantined app is launched from a random
+    read-only copy under /private/var/folders (Gatekeeper's translocation), and
+    anchoring ToRemap/OUT/Logs beside the executable then lands the whole
+    project in that temporary folder. It must fall back to a real, writable,
+    per-user place instead."""
+    from pathlib import Path
+    real = constants.app_dir
+    translocated = Path("/private/var/folders/rz/abcd1234/T/AppTranslocation/"
+                        "0FEEDFACE/d/MatreshkaRemapRenderer.app").parent
+    try:
+        constants.app_dir = lambda: translocated
+        chosen = constants._find_project_dir()
+    finally:
+        constants.app_dir = real
+    want(not constants._looks_translocated(chosen),
+         f"the working folder is still the read-only temp copy: {chosen}")
+    want(constants._is_writable_dir(chosen),
+         f"the fallback folder {chosen} cannot be written to")
+    return f"translocated launch → {chosen}"
+
+
+@check(PATHS, "the folder the app actually resolved is writable and permanent")
+def the_resolved_folder_is_writable():
+    want(not constants._looks_translocated(constants.PROJECT_DIR),
+         f"the project folder resolved to a temp copy: {constants.PROJECT_DIR}")
+    want(constants._is_writable_dir(constants.PROJECT_DIR),
+         f"the project folder {constants.PROJECT_DIR} is not writable")
+    # The two writes that used to sit beside the executable now share it.
+    import depends
+    import logfile
+    want(str(constants.PROJECT_DIR) in str(depends.tools_dir()),
+         f"ffmpeg would still download beside the app: {depends.tools_dir()}")
+    want(str(constants.PROJECT_DIR) in str(logfile.folder()),
+         f"the log would still be written beside the app: {logfile.folder()}")
+    return str(constants.PROJECT_DIR)

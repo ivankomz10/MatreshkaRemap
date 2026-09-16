@@ -31,18 +31,63 @@ def app_dir() -> Path:
     return Path(__file__).resolve().parent
 
 
-def _find_project_dir() -> Path:
-    """The folder holding the .blend.
+def _looks_translocated(path: os.PathLike[str] | str) -> bool:
+    """Whether this is one of macOS's read-only launch copies.
 
-    Compiled, the executable sits next to the .blend, so that is app_dir().
-    During development the sources live in <project>/tool/, so the parent is
-    checked as a fallback.
+    A quarantined app that has not been moved in Finder is run from a random
+    read-only place -- Gatekeeper's "app translocation" -- and anything under
+    the per-user temporary tree is read-only and impermanent too. Writing the
+    project beside the app there lands in a folder that cannot be written to
+    and vanishes when the app quits.
+    """
+    text = str(path)
+    return "AppTranslocation" in text or "/private/var/folders/" in text
+
+
+def _is_writable_dir(path: Path) -> bool:
+    """Whether files can be made in `path`, now or after creating its parents."""
+    try:
+        probe = path
+        while not probe.exists() and probe != probe.parent:
+            probe = probe.parent
+        return probe.exists() and os.access(probe, os.W_OK)
+    except OSError:
+        return False
+
+
+def _fallback_project_dir() -> Path:
+    """A stable, writable, per-user home for the working folders when the app's
+    own location cannot serve -- read-only like /Applications, or a translocated
+    copy. Kept somewhere a person can actually find, not a hidden support dir."""
+    home = Path.home()
+    if sys.platform == "darwin":
+        documents = home / "Documents"
+        return (documents if documents.is_dir() else home) / APP_NAME
+    return home / APP_NAME
+
+
+def _usable(path: Path) -> bool:
+    return not _looks_translocated(path) and _is_writable_dir(path)
+
+
+def _find_project_dir() -> Path:
+    """Where ToRemap, OUT, Snapshots and Logs live.
+
+    Beside the app when that is a real, writable place -- the portable layout
+    the tool is built around, and what happens on Windows and in development.
+    On macOS "beside the app" usually is not writable: /Applications belongs to
+    the system, and a quarantined app that was not moved in Finder launches
+    from a read-only translocated copy under /private/var/folders. In either
+    case the work goes to a stable per-user folder rather than to the temporary
+    one the app happened to be run from.
     """
     here = app_dir()
     for candidate in (here, here.parent):
-        if any(candidate.glob("*.blend")):
+        if any(candidate.glob("*.blend")) and _usable(candidate):
             return candidate
-    return here
+    if _usable(here):
+        return here
+    return _fallback_project_dir()
 
 
 PROJECT_DIR = _find_project_dir()
@@ -75,20 +120,18 @@ def display(path: str | os.PathLike[str]) -> str:
 
 
 def project_dir_problem() -> str | None:
-    """Why the project folder cannot be used, if that is the case.
+    """Why the working folder cannot be used, if that is the case.
 
-    On macOS a quarantined app is launched from a random read-only copy
-    ("app translocation"), and locating the project next to the executable then
-    lands inside that copy. Better to say so plainly than to fail at mkdir.
+    The folder is now chosen to be writable (see `_find_project_dir`), which on
+    macOS steps around both the translocated launch copy and a read-only
+    /Applications by falling back to a per-user folder. The only thing left to
+    report is a genuinely stuck machine where even that cannot be made.
     """
-    text = str(PROJECT_DIR)
-    if "AppTranslocation" in text or "/private/var/folders/" in text:
-        return (
-            "macOS is running this app from a temporary read-only copy. "
-            "Move the app to its folder in Finder, or clear the quarantine flag: "
-            "xattr -dr com.apple.quarantine <app>"
-        )
-    if PROJECT_DIR.exists() and not os.access(PROJECT_DIR, os.W_OK):
+    try:
+        PROJECT_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        return f"Cannot create the working folder {PROJECT_DIR}: {error}"
+    if not os.access(PROJECT_DIR, os.W_OK):
         return f"The folder {PROJECT_DIR} is read-only -- nothing can be unpacked or rendered there."
     return None
 
